@@ -130,3 +130,141 @@ CREATE TABLE IF NOT EXISTS replay_runs (
 
 CREATE INDEX IF NOT EXISTS idx_replay_runs_run_id ON replay_runs(run_id);
 CREATE INDEX IF NOT EXISTS idx_replay_runs_status ON replay_runs(status);
+
+-- AI reports: persisted on-demand report bundles for the web dashboard
+CREATE TABLE IF NOT EXISTS ai_reports (
+    id BIGSERIAL PRIMARY KEY,
+    report_id TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    report_type TEXT NOT NULL DEFAULT 'on_demand',
+    model_provider TEXT NOT NULL,
+    model_name TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+    summary_text TEXT NOT NULL,
+    report_json JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_ai_reports_created_at ON ai_reports(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ai_reports_report_id ON ai_reports(report_id);
+
+-- Read models for dashboard and remote investigation.
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_run_summaries AS
+WITH event_agg AS (
+    SELECT
+        run_id,
+        COUNT(*) AS event_count,
+        MAX(event_timestamp) AS latest_event_at,
+        MAX(CASE WHEN event_type IN ('trade_blocked', 'risk_state_changed', 'fail_safe_activated', 'duplicate_unresolved_entry_detected', 'unresolved_entry_tracked', 'unresolved_entry_cleared') THEN event_timestamp END) AS latest_blocker_at
+    FROM events
+    GROUP BY run_id
+),
+state_agg AS (
+    SELECT
+        run_id,
+        COUNT(*) AS state_snapshot_count,
+        MAX(captured_at) AS latest_state_at
+    FROM state_snapshots
+    GROUP BY run_id
+),
+trade_agg AS (
+    SELECT
+        run_id,
+        COUNT(*) AS trade_count,
+        COALESCE(SUM(pnl), 0) AS total_pnl,
+        MAX(COALESCE(exit_time, inserted_at)) AS latest_trade_at
+    FROM completed_trades
+    GROUP BY run_id
+)
+SELECT
+    r.run_id,
+    r.created_at,
+    r.last_seen_at,
+    r.process_id,
+    r.data_mode,
+    r.symbol,
+    r.status,
+    r.zone,
+    r.zone_state,
+    r.position,
+    r.position_pnl,
+    r.daily_pnl,
+    r.risk_state,
+    COALESCE(e.event_count, 0) AS event_count,
+    COALESCE(s.state_snapshot_count, 0) AS state_snapshot_count,
+    COALESCE(t.trade_count, 0) AS trade_count,
+    COALESCE(t.total_pnl, 0) AS total_pnl,
+    s.latest_state_at,
+    e.latest_event_at,
+    t.latest_trade_at,
+    e.latest_blocker_at
+FROM runs r
+LEFT JOIN event_agg e ON e.run_id = r.run_id
+LEFT JOIN state_agg s ON s.run_id = r.run_id
+LEFT JOIN trade_agg t ON t.run_id = r.run_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_run_summaries_run_id ON mv_run_summaries(run_id);
+CREATE INDEX IF NOT EXISTS idx_mv_run_summaries_latest_seen ON mv_run_summaries(COALESCE(last_seen_at, created_at) DESC);
+
+CREATE MATERIALIZED VIEW IF NOT EXISTS mv_daily_trade_stats AS
+SELECT
+    DATE(COALESCE(exit_time, inserted_at)) AS trade_day,
+    COUNT(*) AS trade_count,
+    COALESCE(SUM(pnl), 0) AS total_pnl,
+    COALESCE(AVG(pnl), 0) AS avg_pnl,
+    COALESCE(MAX(pnl), 0) AS best_trade,
+    COALESCE(MIN(pnl), 0) AS worst_trade
+FROM completed_trades
+GROUP BY DATE(COALESCE(exit_time, inserted_at));
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_daily_trade_stats_day ON mv_daily_trade_stats(trade_day);
+
+CREATE OR REPLACE VIEW v_run_timeline AS
+SELECT
+    run_id,
+    event_timestamp AS timeline_at,
+    'event' AS kind,
+    category,
+    event_type,
+    source,
+    symbol,
+    zone,
+    action,
+    reason,
+    order_id,
+    risk_state,
+    payload_json
+FROM events
+UNION ALL
+SELECT
+    run_id,
+    captured_at AS timeline_at,
+    'state_snapshot' AS kind,
+    status AS category,
+    data_mode AS event_type,
+    NULL::text AS source,
+    symbol,
+    zone,
+    zone_state AS action,
+    last_entry_block_reason AS reason,
+    NULL::text AS order_id,
+    risk_state,
+    payload_json
+FROM state_snapshots
+UNION ALL
+SELECT
+    run_id,
+    COALESCE(exit_time, inserted_at) AS timeline_at,
+    'trade' AS kind,
+    strategy AS category,
+    regime AS event_type,
+    source,
+    NULL::text AS symbol,
+    zone,
+    NULL::text AS action,
+    NULL::text AS reason,
+    NULL::text AS order_id,
+    NULL::text AS risk_state,
+    payload_json
+FROM completed_trades;

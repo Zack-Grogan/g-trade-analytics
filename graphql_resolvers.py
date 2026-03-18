@@ -4,12 +4,12 @@ GraphQL resolvers for g-trade-analytics. All mutations are advisory-only (no exe
 from __future__ import annotations
 
 import os
-from typing import Any, Optional
+from typing import Optional
 
 import httpx
 from strawberry.types import Info
 
-from graphql_schema import Run, Trade, Hypothesis, KnowledgeEntry, MetaLearnerStats, HypothesisInput
+from graphql_schema import AIReport, Hypothesis, HypothesisInput, KnowledgeEntry, MetaLearnerStats, Run, Trade
 from app import get_conn, _require_auth
 from psycopg2.extras import RealDictCursor
 
@@ -99,7 +99,7 @@ async def resolve_trades(
             )
         rows = cur.fetchall()
         return [
-Trade(
+            Trade(
                 id=r["id"],
                 run_id=r["run_id"],
                 entry_time=str(r["entry_time"]) if r.get("entry_time") else None,
@@ -145,7 +145,7 @@ async def resolve_hypotheses(
             )
         rows = cur.fetchall()
         return [
-Hypothesis(
+            Hypothesis(
                 id=r["id"],
                 hypothesis_id=r["hypothesis_id"],
                 generation=r["generation"],
@@ -175,7 +175,7 @@ async def resolve_similar_trades(info: Info, trade_id: int, limit: int = 10) -> 
         return []
     similar = data.get("similar") or []
     return [
-Trade(
+        Trade(
             id=t["id"],
             run_id=t["run_id"],
             entry_time=str(t["entry_time"]) if t.get("entry_time") else None,
@@ -249,6 +249,72 @@ async def resolve_meta_learner_stats(info: Info) -> MetaLearnerStats:
             survival_count=survival,
             rejection_count=rejection,
             stats={"survival_count": survival, "rejection_count": rejection},
+        )
+    finally:
+        conn.close()
+
+
+async def resolve_reports(info: Info, limit: int = 20) -> list[AIReport]:
+    _auth(info)
+    conn = _db(info)
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT id, report_id, title, report_type, model_provider, model_name, status,
+                      summary_text, report_json, created_at, completed_at
+               FROM ai_reports
+               ORDER BY created_at DESC
+               LIMIT %s""",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        return [
+            AIReport(
+                id=r["id"],
+                report_id=r["report_id"],
+                title=r["title"],
+                report_type=r["report_type"],
+                model_provider=r["model_provider"],
+                model_name=r["model_name"],
+                status=r["status"],
+                summary_text=r["summary_text"],
+                report_json=r.get("report_json"),
+                created_at=str(r["created_at"]) if r.get("created_at") else "",
+                completed_at=str(r["completed_at"]) if r.get("completed_at") else None,
+            )
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
+async def resolve_report(info: Info, report_id: str) -> Optional[AIReport]:
+    _auth(info)
+    conn = _db(info)
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT id, report_id, title, report_type, model_provider, model_name, status,
+                      summary_text, report_json, created_at, completed_at
+               FROM ai_reports
+               WHERE report_id = %s""",
+            (report_id,),
+        )
+        r = cur.fetchone()
+        if not r:
+            return None
+        return AIReport(
+            id=r["id"],
+            report_id=r["report_id"],
+            title=r["title"],
+            report_type=r["report_type"],
+            model_provider=r["model_provider"],
+            model_name=r["model_name"],
+            status=r["status"],
+            summary_text=r["summary_text"],
+            report_json=r.get("report_json"),
+            created_at=str(r["created_at"]) if r.get("created_at") else "",
+            completed_at=str(r["completed_at"]) if r.get("completed_at") else None,
         )
     finally:
         conn.close()

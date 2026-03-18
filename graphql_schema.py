@@ -3,7 +3,7 @@ GraphQL schema for g-trade-analytics. Queries and advisory-only mutations (no ex
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Optional
 
 import strawberry
 
@@ -61,6 +61,21 @@ class KnowledgeEntry:
     survival_count: int
     rejection_count: int
     created_at: str
+
+
+@strawberry.type
+class AIReport:
+    id: int
+    report_id: str
+    title: str
+    report_type: str
+    model_provider: str
+    model_name: str
+    status: str
+    summary_text: str
+    report_json: Optional[strawberry.scalars.JSON]
+    created_at: str
+    completed_at: Optional[str]
 
 
 @strawberry.type
@@ -145,6 +160,24 @@ class Query:
     ) -> MetaLearnerStats:
         from graphql_resolvers import resolve_meta_learner_stats
         return await resolve_meta_learner_stats(info)
+
+    @strawberry.field
+    async def reports(
+        self,
+        info: strawberry.types.Info,
+        limit: int = 20,
+    ) -> list[AIReport]:
+        from graphql_resolvers import resolve_reports
+        return await resolve_reports(info, limit=limit)
+
+    @strawberry.field
+    async def report(
+        self,
+        info: strawberry.types.Info,
+        report_id: str,
+    ) -> Optional[AIReport]:
+        from graphql_resolvers import resolve_report
+        return await resolve_report(info, report_id)
 
 
 @strawberry.type
