@@ -86,7 +86,7 @@ class Query:
         info: strawberry.types.Info,
         limit: int = 25,
     ) -> list[Run]:
-        from .graphql_resolvers import resolve_runs
+        from graphql_resolvers import resolve_runs
         return await resolve_runs(info, limit=limit)
 
     @strawberry.field
@@ -95,7 +95,7 @@ class Query:
         info: strawberry.types.Info,
         id: str,
     ) -> Optional[Run]:
-        from .graphql_resolvers import resolve_run
+        from graphql_resolvers import resolve_run
         return await resolve_run(info, id)
 
     @strawberry.field
@@ -105,7 +105,7 @@ class Query:
         run_id: Optional[str] = None,
         limit: int = 100,
     ) -> list[Trade]:
-        from .graphql_resolvers import resolve_trades
+        from graphql_resolvers import resolve_trades
         return await resolve_trades(info, run_id=run_id, limit=limit)
 
     @strawberry.field
@@ -115,7 +115,7 @@ class Query:
         status: Optional[str] = None,
         limit: int = 50,
     ) -> list[Hypothesis]:
-        from .graphql_resolvers import resolve_hypotheses
+        from graphql_resolvers import resolve_hypotheses
         return await resolve_hypotheses(info, status=status, limit=limit)
 
     @strawberry.field
@@ -125,7 +125,7 @@ class Query:
         trade_id: strawberry.ID,
         limit: int = 10,
     ) -> list[Trade]:
-        from .graphql_resolvers import resolve_similar_trades
+        from graphql_resolvers import resolve_similar_trades
         return await resolve_similar_trades(info, int(trade_id), limit=limit)
 
     @strawberry.field
@@ -135,7 +135,7 @@ class Query:
         search: Optional[str] = None,
         limit: int = 50,
     ) -> list[KnowledgeEntry]:
-        from .graphql_resolvers import resolve_knowledge_store
+        from graphql_resolvers import resolve_knowledge_store
         return await resolve_knowledge_store(info, search=search, limit=limit)
 
     @strawberry.field
@@ -143,7 +143,7 @@ class Query:
         self,
         info: strawberry.types.Info,
     ) -> MetaLearnerStats:
-        from .graphql_resolvers import resolve_meta_learner_stats
+        from graphql_resolvers import resolve_meta_learner_stats
         return await resolve_meta_learner_stats(info)
 
 
@@ -155,7 +155,7 @@ class Mutation:
         info: strawberry.types.Info,
         context: HypothesisInput,
     ) -> Optional[Hypothesis]:
-        from .graphql_resolvers import resolve_generate_hypothesis
+        from graphql_resolvers import resolve_generate_hypothesis
         return await resolve_generate_hypothesis(info, context)
 
     @strawberry.mutation
@@ -165,7 +165,7 @@ class Mutation:
         result_id: strawberry.ID,
         verdict: str,
     ) -> Optional[KnowledgeEntry]:
-        from .graphql_resolvers import resolve_submit_conclusion
+        from graphql_resolvers import resolve_submit_conclusion
         return await resolve_submit_conclusion(info, int(result_id), verdict)
 
 
