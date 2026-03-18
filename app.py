@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import os
 import logging
+from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
 import psycopg2
+from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor
 
 logger = logging.getLogger(__name__)
@@ -17,11 +19,42 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 ANALYTICS_API_KEY = os.environ.get("ANALYTICS_API_KEY", "")
 
+_pool: ThreadedConnectionPool | None = None
+
+
+def _get_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL not set")
+        _pool = ThreadedConnectionPool(minconn=1, maxconn=5, dsn=DATABASE_URL)
+        logger.info("Analytics Postgres pool initialised (minconn=1, maxconn=5)")
+    return _pool
+
 
 def get_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not set")
-    return psycopg2.connect(DATABASE_URL)
+    return _get_pool().getconn()
+
+
+def put_conn(conn) -> None:
+    try:
+        _get_pool().putconn(conn)
+    except Exception:
+        logger.warning("put_conn: failed to return connection to pool", exc_info=True)
+
+
+def ensure_schema_v2() -> None:
+    """Apply RLM/analytics extension schema (hypotheses, experiments, knowledge_store, trade_embeddings, memory graph)."""
+    schema_path = os.path.join(os.path.dirname(__file__), "schema_v2.sql")
+    if not os.path.exists(schema_path):
+        return
+    conn = get_conn()
+    try:
+        with open(schema_path) as f:
+            conn.cursor().execute(f.read())
+        conn.commit()
+    finally:
+        put_conn(conn)
 
 
 def _bearer_ok(authorization: str | None) -> bool:
@@ -37,7 +70,16 @@ def _require_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing Bearer token")
 
 
-app = FastAPI(title="g-trade-analytics")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        ensure_schema_v2()
+    except Exception as e:
+        logger.warning("Startup schema_v2 ensure failed: %s", e)
+    yield
+
+
+app = FastAPI(title="g-trade-analytics", lifespan=lifespan)
 
 
 @app.get("/runs")
@@ -65,7 +107,7 @@ async def list_runs(
         rows = cur.fetchall()
         return {"runs": [dict(r) for r in rows]}
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.get("/runs/{run_id}")
@@ -83,7 +125,7 @@ async def get_run(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
         return dict(row)
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.get("/runs/{run_id}/events")
@@ -104,7 +146,7 @@ async def run_events(
         rows = cur.fetchall()
         return {"events": [dict(r) for r in rows]}
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.get("/runs/{run_id}/trades")
@@ -125,7 +167,7 @@ async def run_trades(
         rows = cur.fetchall()
         return {"trades": [dict(r) for r in rows]}
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.get("/analytics/summary")
@@ -144,12 +186,20 @@ async def analytics_summary(
         row = cur.fetchone()
         return {"run_count": runs, "event_count": events, "trade_count": row["trade_count"], "total_pnl": float(row["total_pnl"] or 0)}
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# GraphQL (advisory-only mutations; Bearer auth via info.context["request"])
+from strawberry.fastapi import GraphQLRouter
+from graphql_schema import schema
+
+graphql_app = GraphQLRouter(schema)
+app.include_router(graphql_app, prefix="/graphql")
 
 
 if __name__ == "__main__":
