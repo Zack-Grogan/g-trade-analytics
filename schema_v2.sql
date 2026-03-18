@@ -90,6 +90,26 @@ CREATE TABLE IF NOT EXISTS trade_embeddings (
 
 CREATE INDEX IF NOT EXISTS idx_trade_embeddings_trade_id ON trade_embeddings(trade_id);
 
+-- Runtime logs shipped from the local trader so operators can inspect failures remotely without a cloud->Mac control path.
+CREATE TABLE IF NOT EXISTS runtime_logs (
+    id BIGSERIAL PRIMARY KEY,
+    run_id TEXT,
+    logged_at TIMESTAMPTZ NOT NULL,
+    inserted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    level TEXT,
+    logger_name TEXT,
+    source TEXT,
+    service_name TEXT,
+    process_id INT,
+    line_hash TEXT,
+    message TEXT NOT NULL,
+    payload_json JSONB NOT NULL DEFAULT '{}'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_runtime_logs_run_id ON runtime_logs(run_id, logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_logs_logged_at ON runtime_logs(logged_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_logs_level ON runtime_logs(level, logged_at DESC);
+
 -- Internal memory graph: nodes (hypotheses, conclusions, trade clusters, regime snapshots)
 CREATE TABLE IF NOT EXISTS memory_nodes (
     id BIGSERIAL PRIMARY KEY,
@@ -168,6 +188,30 @@ state_agg AS (
     FROM state_snapshots
     GROUP BY run_id
 ),
+decision_agg AS (
+    SELECT
+        run_id,
+        COUNT(*) AS decision_snapshot_count,
+        MAX(decided_at) AS latest_decision_at
+    FROM decision_snapshots
+    GROUP BY run_id
+),
+market_agg AS (
+    SELECT
+        run_id,
+        COUNT(*) AS market_tape_count,
+        MAX(captured_at) AS latest_market_at
+    FROM market_tape
+    GROUP BY run_id
+),
+order_agg AS (
+    SELECT
+        run_id,
+        COUNT(*) AS order_lifecycle_count,
+        MAX(observed_at) AS latest_order_at
+    FROM order_lifecycle
+    GROUP BY run_id
+),
 trade_agg AS (
     SELECT
         run_id,
@@ -175,6 +219,14 @@ trade_agg AS (
         COALESCE(SUM(pnl), 0) AS total_pnl,
         MAX(COALESCE(exit_time, inserted_at)) AS latest_trade_at
     FROM completed_trades
+    GROUP BY run_id
+),
+runtime_log_agg AS (
+    SELECT
+        run_id,
+        COUNT(*) AS runtime_log_count,
+        MAX(logged_at) AS latest_runtime_log_at
+    FROM runtime_logs
     GROUP BY run_id
 )
 SELECT
@@ -193,15 +245,27 @@ SELECT
     r.risk_state,
     COALESCE(e.event_count, 0) AS event_count,
     COALESCE(s.state_snapshot_count, 0) AS state_snapshot_count,
+    COALESCE(d.decision_snapshot_count, 0) AS decision_snapshot_count,
+    COALESCE(m.market_tape_count, 0) AS market_tape_count,
+    COALESCE(o.order_lifecycle_count, 0) AS order_lifecycle_count,
     COALESCE(t.trade_count, 0) AS trade_count,
+    COALESCE(l.runtime_log_count, 0) AS runtime_log_count,
     COALESCE(t.total_pnl, 0) AS total_pnl,
     s.latest_state_at,
+    d.latest_decision_at,
+    m.latest_market_at,
+    o.latest_order_at,
+    l.latest_runtime_log_at,
     e.latest_event_at,
     t.latest_trade_at,
     e.latest_blocker_at
 FROM runs r
 LEFT JOIN event_agg e ON e.run_id = r.run_id
 LEFT JOIN state_agg s ON s.run_id = r.run_id
+LEFT JOIN decision_agg d ON d.run_id = r.run_id
+LEFT JOIN market_agg m ON m.run_id = r.run_id
+LEFT JOIN order_agg o ON o.run_id = r.run_id
+LEFT JOIN runtime_log_agg l ON l.run_id = r.run_id
 LEFT JOIN trade_agg t ON t.run_id = r.run_id;
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mv_run_summaries_run_id ON mv_run_summaries(run_id);
@@ -252,6 +316,70 @@ SELECT
     risk_state,
     payload_json
 FROM state_snapshots
+UNION ALL
+SELECT
+    run_id,
+    decided_at AS timeline_at,
+    'decision_snapshot' AS kind,
+    action AS category,
+    reason AS event_type,
+    decision_id AS source,
+    symbol,
+    zone,
+    outcome AS action,
+    outcome_reason AS reason,
+    NULL::text AS order_id,
+    NULL::text AS risk_state,
+    payload_json
+FROM decision_snapshots
+UNION ALL
+SELECT
+    run_id,
+    observed_at AS timeline_at,
+    'order_lifecycle' AS kind,
+    event_type AS category,
+    status AS event_type,
+    order_id AS source,
+    symbol,
+    zone,
+    status AS action,
+    reason,
+    order_id,
+    NULL::text AS risk_state,
+    payload_json
+FROM order_lifecycle
+UNION ALL
+SELECT
+    run_id,
+    captured_at AS timeline_at,
+    'market_tape' AS kind,
+    symbol AS category,
+    trade_side AS event_type,
+    source,
+    symbol,
+    NULL::text AS zone,
+    trade_side AS action,
+    NULL::text AS reason,
+    NULL::text AS order_id,
+    NULL::text AS risk_state,
+    payload_json
+FROM market_tape
+UNION ALL
+SELECT
+    run_id,
+    logged_at AS timeline_at,
+    'runtime_log' AS kind,
+    COALESCE(service_name, logger_name, source) AS category,
+    level AS event_type,
+    COALESCE(logger_name, source) AS source,
+    NULL::text AS symbol,
+    NULL::text AS zone,
+    level AS action,
+    message AS reason,
+    NULL::text AS order_id,
+    NULL::text AS risk_state,
+    payload_json
+FROM runtime_logs
 UNION ALL
 SELECT
     run_id,

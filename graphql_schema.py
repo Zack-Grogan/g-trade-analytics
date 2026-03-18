@@ -1,5 +1,5 @@
 """
-GraphQL schema for g-trade-analytics. Queries and advisory-only mutations (no executor changes).
+GraphQL schema for g-trade-analytics. Query-only read surface over Postgres.
 """
 from __future__ import annotations
 
@@ -83,14 +83,6 @@ class MetaLearnerStats:
     survival_count: int
     rejection_count: int
     stats: strawberry.scalars.JSON
-
-
-@strawberry.input
-class HypothesisInput:
-    regime_context: Optional[str] = None
-    prior_conclusions_summary: Optional[str] = None
-    generation: Optional[int] = 1
-    parent_hypothesis_id: Optional[str] = None
 
 
 @strawberry.type
@@ -180,26 +172,4 @@ class Query:
         return await resolve_report(info, report_id)
 
 
-@strawberry.type
-class Mutation:
-    @strawberry.mutation
-    async def generate_hypothesis(
-        self,
-        info: strawberry.types.Info,
-        context: HypothesisInput,
-    ) -> Optional[Hypothesis]:
-        from graphql_resolvers import resolve_generate_hypothesis
-        return await resolve_generate_hypothesis(info, context)
-
-    @strawberry.mutation
-    async def submit_conclusion(
-        self,
-        info: strawberry.types.Info,
-        result_id: strawberry.ID,
-        verdict: str,
-    ) -> Optional[KnowledgeEntry]:
-        from graphql_resolvers import resolve_submit_conclusion
-        return await resolve_submit_conclusion(info, int(result_id), verdict)
-
-
-schema = strawberry.Schema(query=Query, mutation=Mutation)
+schema = strawberry.Schema(query=Query)

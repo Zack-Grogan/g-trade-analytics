@@ -1,6 +1,6 @@
 """
-g-trade-analytics: G-Trade analytics service; read-only API over Postgres for runs, events, trades.
-Auth: Bearer ANALYTICS_API_KEY (single-operator).
+g-trade-analytics: G-Trade analytics service; query-only API over Postgres.
+Auth: Bearer ANALYTICS_API_KEY or GTRADE_INTERNAL_API_TOKEN.
 """
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import logging
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Optional, Generator
 
-from fastapi import FastAPI, Header, HTTPException, Query, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor, RealDictConnection
@@ -17,6 +17,7 @@ from psycopg2.extras import RealDictCursor, RealDictConnection
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+INTERNAL_API_TOKEN = (os.environ.get("GTRADE_INTERNAL_API_TOKEN") or "").strip()
 ANALYTICS_API_KEY = os.environ.get("ANALYTICS_API_KEY", "")
 
 _pool: ThreadedConnectionPool | None = None
@@ -73,12 +74,48 @@ def _iso(value: Any) -> str | None:
     return str(value)
 
 
+def _runtime_log_filters(
+    *,
+    run_id: Optional[str] = None,
+    level: Optional[str] = None,
+    search: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+) -> tuple[list[str], list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if run_id:
+        clauses.append("run_id = %s")
+        params.append(run_id)
+    if level:
+        clauses.append("level = %s")
+        params.append(level)
+    if start_time:
+        clauses.append("logged_at >= %s")
+        params.append(start_time)
+    if end_time:
+        clauses.append("logged_at <= %s")
+        params.append(end_time)
+    if search:
+        pattern = f"%{search}%"
+        clauses.append(
+            "(message ILIKE %s OR logger_name ILIKE %s OR source ILIKE %s OR service_name ILIKE %s OR payload_json::text ILIKE %s)"
+        )
+        params.extend([pattern, pattern, pattern, pattern, pattern])
+    return clauses, params
+
+
 def check_pool_health() -> dict[str, Any]:
     """Check connection pool health and return stats."""
     pool = _get_pool()
+    available = len(getattr(pool, "_pool", []))
+    borrowed = len(getattr(pool, "_used", {}))
     return {
-        "pool_size": max(0, pool._used - pool._pool.qsize()) if hasattr(pool, '_pool') else "unknown",
-        "pool_available": pool._pool.qsize() if hasattr(pool, '_pool') else "unknown",
+        "pool_minconn": getattr(pool, "minconn", None),
+        "pool_maxconn": getattr(pool, "maxconn", None),
+        "pool_available": available,
+        "pool_borrowed": borrowed,
+        "pool_closed": bool(getattr(pool, "closed", False)),
     }
 
 
@@ -97,16 +134,20 @@ def ensure_schema_v2() -> None:
 
 
 def _bearer_ok(authorization: str | None) -> bool:
-    if not ANALYTICS_API_KEY:
-        return False
     if not authorization or not authorization.startswith("Bearer "):
         return False
-    return authorization[7:].strip() == ANALYTICS_API_KEY.strip()
+    token = authorization[7:].strip()
+    allowed = [candidate for candidate in (INTERNAL_API_TOKEN, ANALYTICS_API_KEY.strip()) if candidate]
+    return bool(allowed) and token in allowed
 
 
 def _require_auth(authorization: str | None) -> None:
     if not _bearer_ok(authorization):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing Bearer token")
+
+
+def _require_graphql_auth(authorization: str | None = Header(None)) -> None:
+    _require_auth(authorization)
 
 
 @asynccontextmanager
@@ -134,14 +175,17 @@ async def list_runs(
         if search:
             cur.execute(
                 """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
-                          position, position_pnl, daily_pnl, risk_state, last_entry_block_reason, payload_json
-                   FROM runs
+                          position, position_pnl, daily_pnl, risk_state, event_count, state_snapshot_count,
+                          decision_snapshot_count, market_tape_count, order_lifecycle_count, trade_count, total_pnl,
+                          latest_state_at, latest_decision_at, latest_market_at, latest_order_at, latest_event_at,
+                          latest_trade_at, latest_blocker_at
+                   FROM mv_run_summaries
                    WHERE run_id ILIKE %s
                       OR data_mode ILIKE %s
                       OR status ILIKE %s
                       OR zone ILIKE %s
                       OR risk_state ILIKE %s
-                      OR payload_json::text ILIKE %s
+                      OR symbol ILIKE %s
                    ORDER BY COALESCE(last_seen_at, created_at) DESC
                    LIMIT %s""",
                 (f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", limit),
@@ -149,14 +193,54 @@ async def list_runs(
         else:
             cur.execute(
                 """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
-                          position, position_pnl, daily_pnl, risk_state, last_entry_block_reason, payload_json
-                   FROM runs
+                          position, position_pnl, daily_pnl, risk_state, event_count, state_snapshot_count,
+                          decision_snapshot_count, market_tape_count, order_lifecycle_count, trade_count, total_pnl,
+                          latest_state_at, latest_decision_at, latest_market_at, latest_order_at, latest_event_at,
+                          latest_trade_at, latest_blocker_at
+                   FROM mv_run_summaries
                    ORDER BY COALESCE(last_seen_at, created_at) DESC
                    LIMIT %s""",
                 (limit,),
             )
         rows = cur.fetchall()
         return {"runs": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/runs/compare")
+async def compare_runs(
+    authorization: str | None = Header(None),
+    left_run_id: str = Query(...),
+    right_run_id: str = Query(...),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM mv_run_summaries WHERE run_id = %s", (left_run_id,))
+        left = cur.fetchone()
+        cur.execute("SELECT * FROM mv_run_summaries WHERE run_id = %s", (right_run_id,))
+        right = cur.fetchone()
+        if not left or not right:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found")
+        left_dict = dict(left)
+        right_dict = dict(right)
+        return {
+            "left_run_id": left_run_id,
+            "right_run_id": right_run_id,
+            "left": left_dict,
+            "right": right_dict,
+            "delta": {
+                "event_count": int(right_dict.get("event_count") or 0) - int(left_dict.get("event_count") or 0),
+                "state_snapshot_count": int(right_dict.get("state_snapshot_count") or 0) - int(left_dict.get("state_snapshot_count") or 0),
+                "decision_snapshot_count": int(right_dict.get("decision_snapshot_count") or 0) - int(left_dict.get("decision_snapshot_count") or 0),
+                "market_tape_count": int(right_dict.get("market_tape_count") or 0) - int(left_dict.get("market_tape_count") or 0),
+                "order_lifecycle_count": int(right_dict.get("order_lifecycle_count") or 0) - int(left_dict.get("order_lifecycle_count") or 0),
+                "trade_count": int(right_dict.get("trade_count") or 0) - int(left_dict.get("trade_count") or 0),
+                "total_pnl": float(right_dict.get("total_pnl") or 0) - float(left_dict.get("total_pnl") or 0),
+            },
+        }
     finally:
         put_conn(conn)
 
@@ -171,11 +255,15 @@ async def get_run(
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
-                      position, position_pnl, daily_pnl, risk_state, last_signal_json, last_entry_block_reason,
-                      execution_json, heartbeat_json, lifecycle_json, payload_json
-               FROM runs
-               WHERE run_id = %s""",
+            """SELECT r.run_id, r.created_at, r.last_seen_at, r.process_id, r.data_mode, r.symbol, r.status, r.zone,
+                      r.zone_state, r.position, r.position_pnl, r.daily_pnl, r.risk_state, r.last_signal_json,
+                      r.last_entry_block_reason, r.execution_json, r.heartbeat_json, r.lifecycle_json, r.payload_json,
+                      s.event_count, s.state_snapshot_count, s.decision_snapshot_count, s.market_tape_count,
+                      s.order_lifecycle_count, s.trade_count, s.total_pnl, s.latest_state_at, s.latest_decision_at,
+                      s.latest_market_at, s.latest_order_at, s.latest_event_at, s.latest_trade_at, s.latest_blocker_at
+               FROM runs r
+               LEFT JOIN mv_run_summaries s ON s.run_id = r.run_id
+               WHERE r.run_id = %s""",
             (run_id,),
         )
         row = cur.fetchone()
@@ -296,6 +384,299 @@ async def run_state_snapshots(
         put_conn(conn)
 
 
+@app.get("/runs/{run_id}/market_tape")
+async def run_market_tape(
+    run_id: str,
+    authorization: str | None = Header(None),
+    limit: int = Query(500, ge=1, le=2000),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT id, run_id, captured_at, inserted_at, process_id, symbol, contract_id, bid, ask, last, volume,
+                      bid_size, ask_size, last_size, volume_is_cumulative, quote_is_synthetic, trade_side, latency_ms,
+                      source, sequence, payload_json
+               FROM market_tape
+               WHERE run_id = %s
+               ORDER BY captured_at DESC, id DESC
+               LIMIT %s""",
+            (run_id, limit),
+        )
+        rows = cur.fetchall()
+        return {"marketTape": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/runs/{run_id}/decision_snapshots")
+async def run_decision_snapshots(
+    run_id: str,
+    authorization: str | None = Header(None),
+    limit: int = Query(200, ge=1, le=2000),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT id, run_id, decided_at, inserted_at, decision_id, attempt_id, process_id, symbol, zone,
+                      action, reason, outcome, outcome_reason, long_score, short_score, flat_bias, score_gap,
+                      dominant_side, current_price, allow_entries, execution_tradeable, contracts, order_type,
+                      limit_price, decision_price, side, stop_loss, take_profit, max_hold_minutes, regime_state,
+                      regime_reason, active_session, active_vetoes_json, feature_snapshot_json, entry_guard_json,
+                      unresolved_entry_json, event_context_json, order_flow_json, payload_json
+               FROM decision_snapshots
+               WHERE run_id = %s
+               ORDER BY decided_at DESC, id DESC
+               LIMIT %s""",
+            (run_id, limit),
+        )
+        rows = cur.fetchall()
+        return {"decisionSnapshots": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/runs/{run_id}/order_lifecycle")
+async def run_order_lifecycle(
+    run_id: str,
+    authorization: str | None = Header(None),
+    limit: int = Query(500, ge=1, le=5000),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT id, run_id, observed_at, inserted_at, decision_id, attempt_id, order_id, position_id, trade_id,
+                      process_id, symbol, event_type, status, side, role, is_protective, order_type, quantity, contracts,
+                      limit_price, stop_price, expected_fill_price, filled_price, filled_quantity, remaining_quantity,
+                      zone, reason, lifecycle_state, payload_json
+               FROM order_lifecycle
+               WHERE run_id = %s
+               ORDER BY observed_at DESC, id DESC
+               LIMIT %s""",
+            (run_id, limit),
+        )
+        rows = cur.fetchall()
+        return {"orderLifecycle": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/runs/{run_id}/bridge_health")
+async def run_bridge_health(
+    run_id: str,
+    authorization: str | None = Header(None),
+    limit: int = Query(100, ge=1, le=1000),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT id, run_id, observed_at, bridge_status, queue_depth, last_flush_at, last_success_at, last_error,
+                      payload_json
+               FROM bridge_ingest_health
+               WHERE run_id = %s
+               ORDER BY observed_at DESC, id DESC
+               LIMIT %s""",
+            (run_id, limit),
+        )
+        rows = cur.fetchall()
+        return {"bridgeHealth": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/runs/{run_id}/runtime_logs")
+async def run_runtime_logs(
+    run_id: str,
+    authorization: str | None = Header(None),
+    limit: int = Query(200, ge=1, le=2000),
+    level: Optional[str] = None,
+    search: Optional[str] = None,
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        clauses, params = _runtime_log_filters(
+            run_id=run_id,
+            level=level,
+            search=search,
+            start_time=start_time,
+            end_time=end_time,
+        )
+        params.append(limit)
+        cur.execute(
+            f"""SELECT id, run_id, logged_at, inserted_at, level, logger_name, source, service_name, process_id,
+                       line_hash, message, payload_json
+                FROM runtime_logs
+                WHERE {' AND '.join(clauses)}
+                ORDER BY logged_at DESC, id DESC
+                LIMIT %s""",
+            tuple(params),
+        )
+        rows = cur.fetchall()
+        return {"runtimeLogs": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/runs/{run_id}/manifest")
+async def run_manifest(
+    run_id: str,
+    authorization: str | None = Header(None),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, config_path, config_hash,
+                      log_path, sqlite_path, git_commit, git_branch, git_dirty, git_available, app_version, payload_json
+               FROM run_manifests
+               WHERE run_id = %s""",
+            (run_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run manifest not found")
+        return dict(row)
+    finally:
+        put_conn(conn)
+
+
+@app.get("/runs/{run_id}/non_entry_explanations")
+async def run_non_entry_explanations(
+    run_id: str,
+    authorization: str | None = Header(None),
+    limit: int = Query(200, ge=1, le=1000),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT reason, outcome, outcome_reason, action, decision_id, attempt_id, zone, zone_state, symbol,
+                      action AS decision_action, long_score, short_score, flat_bias, score_gap, payload_json, decided_at
+               FROM decision_snapshots
+               WHERE run_id = %s
+                 AND COALESCE(outcome, '') <> 'order_submitted'
+               ORDER BY decided_at DESC, id DESC
+               LIMIT %s""",
+            (run_id, limit),
+        )
+        rows = cur.fetchall()
+        return {
+            "run_id": run_id,
+            "explanations": [dict(r) for r in rows],
+            "counts": {
+                "total": len(rows),
+                "blocked": sum(1 for row in rows if (row.get("outcome") or "").lower() not in {"", "order_submitted"}),
+            },
+        }
+    finally:
+        put_conn(conn)
+
+
+@app.get("/search/runs")
+async def search_runs(
+    authorization: str | None = Header(None),
+    q: str = Query(..., min_length=1),
+    limit: int = Query(25, ge=1, le=100),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
+                      position, position_pnl, daily_pnl, risk_state, event_count, state_snapshot_count,
+                      decision_snapshot_count, market_tape_count, order_lifecycle_count, trade_count, total_pnl,
+                      latest_state_at, latest_decision_at, latest_market_at, latest_order_at, latest_event_at,
+                      latest_trade_at, latest_blocker_at
+               FROM mv_run_summaries
+               WHERE run_id ILIKE %s OR data_mode ILIKE %s OR status ILIKE %s OR zone ILIKE %s OR risk_state ILIKE %s
+                  OR symbol ILIKE %s
+               ORDER BY COALESCE(last_seen_at, created_at) DESC
+               LIMIT %s""",
+            (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", limit),
+        )
+        rows = cur.fetchall()
+        return {"runs": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/search/events")
+async def search_events(
+    authorization: str | None = Header(None),
+    q: str = Query(..., min_length=1),
+    limit: int = Query(100, ge=1, le=500),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        pattern = f"%{q}%"
+        cur.execute(
+            """SELECT id, run_id, event_timestamp, inserted_at, category, event_type, source, symbol, zone, action,
+                      reason, order_id, risk_state, contracts, order_status, guard_reason, decision_side, decision_price,
+                      expected_fill_price, entry_guard_json, unresolved_entry_json, execution_json, payload_json
+               FROM events
+               WHERE reason ILIKE %s
+                  OR action ILIKE %s
+                  OR symbol ILIKE %s
+                  OR zone ILIKE %s
+                  OR source ILIKE %s
+                  OR event_type ILIKE %s
+                  OR payload_json::text ILIKE %s
+               ORDER BY event_timestamp DESC, id DESC
+               LIMIT %s""",
+            (pattern, pattern, pattern, pattern, pattern, pattern, pattern, limit),
+        )
+        rows = cur.fetchall()
+        return {"events": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/search/runtime_logs")
+async def search_runtime_logs(
+    authorization: str | None = Header(None),
+    q: str = Query(..., min_length=1),
+    run_id: Optional[str] = None,
+    level: Optional[str] = None,
+    limit: int = Query(200, ge=1, le=2000),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        clauses, params = _runtime_log_filters(run_id=run_id, level=level, search=q)
+        params.append(limit)
+        where = " AND ".join(clauses) if clauses else "TRUE"
+        cur.execute(
+            f"""SELECT id, run_id, logged_at, inserted_at, level, logger_name, source, service_name, process_id,
+                       line_hash, message, payload_json
+                FROM runtime_logs
+                WHERE {where}
+                ORDER BY logged_at DESC, id DESC
+                LIMIT %s""",
+            tuple(params),
+        )
+        rows = cur.fetchall()
+        return {"runtimeLogs": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
+
+
 @app.get("/runs/{run_id}/timeline")
 async def run_timeline(
     run_id: str,
@@ -307,68 +688,33 @@ async def run_timeline(
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            """SELECT id, run_id, event_timestamp, inserted_at, category, event_type, source, symbol, zone, action,
-                      reason, order_id, risk_state, contracts, order_status, guard_reason, decision_side, decision_price,
-                      expected_fill_price, entry_guard_json, unresolved_entry_json, execution_json, payload_json
-               FROM events
+            """SELECT *
+               FROM v_run_timeline
                WHERE run_id = %s
-               ORDER BY event_timestamp DESC, id DESC
+               ORDER BY timeline_at DESC
                LIMIT %s""",
             (run_id, limit),
         )
-        events = cur.fetchall()
-        cur.execute(
-            """SELECT id, run_id, captured_at, status, data_mode, symbol, zone, zone_state, position, position_pnl,
-                      daily_pnl, risk_state, last_signal_json, last_entry_reason, last_entry_block_reason, decision_price,
-                      entry_guard_json, unresolved_entry_json, execution_json, heartbeat_json, lifecycle_json,
-                      observability_json, payload_json
-               FROM state_snapshots
-               WHERE run_id = %s
-               ORDER BY captured_at DESC, id DESC
-               LIMIT %s""",
-            (run_id, limit),
-        )
-        snapshots = cur.fetchall()
-        cur.execute(
-            """SELECT id, run_id, inserted_at, entry_time, exit_time, direction, contracts, entry_price, exit_price, pnl,
-                      zone, strategy, regime, event_tags_json, source, backfilled, payload_json
-               FROM completed_trades
-               WHERE run_id = %s
-               ORDER BY COALESCE(exit_time, inserted_at) DESC, id DESC
-               LIMIT %s""",
-            (run_id, limit),
-        )
-        trades = cur.fetchall()
+        rows = cur.fetchall()
     finally:
         put_conn(conn)
 
     timeline: list[dict[str, Any]] = []
-    for row in events:
+    for row in rows:
         item = dict(row)
-        item["kind"] = "event"
-        item["timestamp"] = _iso(item.pop("event_timestamp"))
-        item["inserted_at"] = _iso(item.get("inserted_at"))
+        item["timestamp"] = _iso(item.get("timeline_at"))
         timeline.append(item)
-    for row in snapshots:
-        item = dict(row)
-        item["kind"] = "state_snapshot"
-        item["timestamp"] = _iso(item.pop("captured_at"))
-        timeline.append(item)
-    for row in trades:
-        item = dict(row)
-        item["kind"] = "trade"
-        item["timestamp"] = _iso(item.get("exit_time") or item.get("inserted_at"))
-        item["inserted_at"] = _iso(item.get("inserted_at"))
-        timeline.append(item)
-
-    timeline.sort(key=lambda item: item.get("timestamp") or "", reverse=True)
     blockers = [
         item
         for item in timeline
-        if item.get("kind") == "event" and (
-            item.get("event_type") in {"trade_blocked", "risk_state_changed", "fail_safe_activated", "duplicate_unresolved_entry_detected", "unresolved_entry_tracked", "unresolved_entry_cleared"}
-            or item.get("guard_reason")
-            or item.get("reason")
+        if (
+            item.get("kind") in {"event", "decision_snapshot", "order_lifecycle"}
+            and (
+                item.get("event_type") in {"trade_blocked", "risk_state_changed", "fail_safe_activated", "duplicate_unresolved_entry_detected", "unresolved_entry_tracked", "unresolved_entry_cleared"}
+                or item.get("guard_reason")
+                or item.get("reason")
+                or item.get("outcome_reason")
+            )
         )
     ]
     return {
@@ -376,11 +722,41 @@ async def run_timeline(
         "timeline": timeline,
         "blockers": blockers,
         "counts": {
-            "events": len(events),
-            "state_snapshots": len(snapshots),
-            "trades": len(trades),
+            "timeline_entries": len(rows),
+            "blockers": len(blockers),
         },
     }
+
+
+@app.get("/bridge/failures")
+async def bridge_failures(
+    authorization: str | None = Header(None),
+    run_id: Optional[str] = None,
+    limit: int = Query(100, ge=1, le=1000),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        clauses = ["(COALESCE(last_error, '') <> '' OR COALESCE(bridge_status, '') NOT IN ('running', 'healthy', 'ok'))"]
+        params: list[Any] = []
+        if run_id:
+            clauses.append("run_id = %s")
+            params.append(run_id)
+        params.append(limit)
+        cur.execute(
+            f"""SELECT id, run_id, observed_at, bridge_status, queue_depth, last_flush_at, last_success_at, last_error,
+                       payload_json
+                FROM bridge_ingest_health
+                WHERE {' AND '.join(clauses)}
+                ORDER BY observed_at DESC, id DESC
+                LIMIT %s""",
+            tuple(params),
+        )
+        rows = cur.fetchall()
+        return {"failures": [dict(r) for r in rows]}
+    finally:
+        put_conn(conn)
 
 
 @app.get("/analytics/summary")
@@ -391,31 +767,100 @@ async def analytics_summary(
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT COUNT(*) AS run_count FROM runs")
-        runs = cur.fetchone()["run_count"]
-        cur.execute("SELECT COUNT(*) AS event_count FROM events")
-        events = cur.fetchone()["event_count"]
-        cur.execute("SELECT COUNT(*) AS state_snapshot_count, MAX(captured_at) AS latest_state_at FROM state_snapshots")
-        snapshots = cur.fetchone()
-        cur.execute("SELECT COUNT(*) AS trade_count, COALESCE(SUM(pnl), 0) AS total_pnl FROM completed_trades")
-        row = cur.fetchone()
+        cur.execute(
+            """SELECT
+                   COUNT(*) AS run_count,
+                   COALESCE(SUM(event_count), 0) AS event_count,
+                   COALESCE(SUM(state_snapshot_count), 0) AS state_snapshot_count,
+                   COALESCE(SUM(decision_snapshot_count), 0) AS decision_snapshot_count,
+                   COALESCE(SUM(market_tape_count), 0) AS market_tape_count,
+                   COALESCE(SUM(order_lifecycle_count), 0) AS order_lifecycle_count,
+                   COALESCE(SUM(runtime_log_count), 0) AS runtime_log_count,
+                   COALESCE(SUM(trade_count), 0) AS trade_count,
+                   COALESCE(SUM(total_pnl), 0) AS total_pnl,
+                   MAX(latest_state_at) AS latest_state_at,
+                   MAX(latest_decision_at) AS latest_decision_at,
+                   MAX(latest_market_at) AS latest_market_at,
+                   MAX(latest_order_at) AS latest_order_at,
+                   MAX(latest_runtime_log_at) AS latest_runtime_log_at,
+                   MAX(latest_event_at) AS latest_event_at,
+                   MAX(latest_trade_at) AS latest_trade_at,
+                   MAX(latest_blocker_at) AS latest_blocker_at,
+                   MAX(last_seen_at) AS latest_run_seen_at
+               FROM mv_run_summaries"""
+        )
+        summary = cur.fetchone()
         cur.execute("SELECT COUNT(*) AS report_count, MAX(created_at) AS latest_report_at FROM ai_reports")
         reports = cur.fetchone()
         cur.execute("SELECT COUNT(*) AS blocker_count FROM events WHERE event_type IN ('trade_blocked', 'risk_state_changed', 'fail_safe_activated', 'duplicate_unresolved_entry_detected', 'unresolved_entry_tracked', 'unresolved_entry_cleared')")
         blockers = cur.fetchone()
-        cur.execute("SELECT MAX(last_seen_at) AS latest_run_seen_at FROM runs")
-        latest_run_seen = cur.fetchone()
+        cur.execute("SELECT COUNT(*) AS bridge_failure_count, MAX(observed_at) AS latest_bridge_failure_at FROM bridge_ingest_health WHERE COALESCE(last_error, '') <> ''")
+        bridge_failures_row = cur.fetchone()
         return {
-            "run_count": runs,
-            "event_count": events,
-            "state_snapshot_count": snapshots["state_snapshot_count"],
-            "latest_state_at": _iso(snapshots.get("latest_state_at")),
-            "trade_count": row["trade_count"],
-            "total_pnl": float(row["total_pnl"] or 0),
+            "run_count": summary["run_count"],
+            "event_count": summary["event_count"],
+            "state_snapshot_count": summary["state_snapshot_count"],
+            "decision_snapshot_count": summary["decision_snapshot_count"],
+            "market_tape_count": summary["market_tape_count"],
+            "order_lifecycle_count": summary["order_lifecycle_count"],
+            "runtime_log_count": summary["runtime_log_count"],
+            "latest_state_at": _iso(summary.get("latest_state_at")),
+            "latest_decision_at": _iso(summary.get("latest_decision_at")),
+            "latest_market_at": _iso(summary.get("latest_market_at")),
+            "latest_order_at": _iso(summary.get("latest_order_at")),
+            "latest_runtime_log_at": _iso(summary.get("latest_runtime_log_at")),
+            "latest_event_at": _iso(summary.get("latest_event_at")),
+            "latest_trade_at": _iso(summary.get("latest_trade_at")),
+            "latest_blocker_at": _iso(summary.get("latest_blocker_at")),
+            "trade_count": summary["trade_count"],
+            "total_pnl": float(summary["total_pnl"] or 0),
             "report_count": reports["report_count"],
             "latest_report_at": _iso(reports.get("latest_report_at")),
             "blocker_count": blockers["blocker_count"],
-            "latest_run_seen_at": _iso(latest_run_seen.get("latest_run_seen_at")),
+            "bridge_failure_count": bridge_failures_row["bridge_failure_count"],
+            "latest_bridge_failure_at": _iso(bridge_failures_row.get("latest_bridge_failure_at")),
+            "latest_run_seen_at": _iso(summary.get("latest_run_seen_at")),
+        }
+    finally:
+        put_conn(conn)
+
+
+@app.get("/service-health")
+async def service_health(
+    authorization: str | None = Header(None),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """SELECT run_id, observed_at, bridge_status, queue_depth, last_success_at, last_error
+               FROM bridge_ingest_health
+               ORDER BY observed_at DESC, id DESC
+               LIMIT 1"""
+        )
+        latest_bridge = cur.fetchone()
+        cur.execute(
+            """SELECT COUNT(*) AS runtime_log_count, MAX(logged_at) AS latest_runtime_log_at
+               FROM runtime_logs"""
+        )
+        runtime_logs = cur.fetchone()
+        cur.execute(
+            """SELECT COUNT(*) AS report_count, MAX(created_at) AS latest_report_at
+               FROM ai_reports"""
+        )
+        reports = cur.fetchone()
+        return {
+            "analytics": {"status": "ok", "pool": check_pool_health()},
+            "bridge": dict(latest_bridge) if latest_bridge else None,
+            "runtime_logs": {
+                "count": runtime_logs["runtime_log_count"],
+                "latest_logged_at": _iso(runtime_logs.get("latest_runtime_log_at")),
+            },
+            "reports": {
+                "count": reports["report_count"],
+                "latest_created_at": _iso(reports.get("latest_report_at")),
+            },
         }
     finally:
         put_conn(conn)
@@ -427,11 +872,11 @@ async def health():
     return {"status": "ok", "pool": pool_health}
 
 
-# GraphQL (advisory-only mutations; Bearer auth via info.context["request"])
+# GraphQL query surface (read-only; Bearer auth via dependency and info.context["request"])
 from strawberry.fastapi import GraphQLRouter
 from graphql_schema import schema
 
-graphql_app = GraphQLRouter(schema)
+graphql_app = GraphQLRouter(schema, dependencies=[Depends(_require_graphql_auth)])
 app.include_router(graphql_app, prefix="/graphql")
 
 

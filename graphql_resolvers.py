@@ -1,16 +1,17 @@
 """
-GraphQL resolvers for g-trade-analytics. All mutations are advisory-only (no executor changes).
+GraphQL resolvers for g-trade-analytics. Query-only read surface over Postgres.
 """
 from __future__ import annotations
 
 import os
 from typing import Optional
 
-import httpx
 from strawberry.types import Info
 
-from graphql_schema import AIReport, Hypothesis, HypothesisInput, KnowledgeEntry, MetaLearnerStats, Run, Trade
-from app import get_conn, _require_auth
+import httpx
+
+from graphql_schema import AIReport, Hypothesis, KnowledgeEntry, MetaLearnerStats, Run, Trade
+from app import get_conn, put_conn, _require_auth
 from psycopg2.extras import RealDictCursor
 
 # Token to authenticate calls from analytics to the RLM service (if deployed with auth).
@@ -49,7 +50,7 @@ async def resolve_runs(info: Info, limit: int = 25) -> list[Run]:
             for r in rows
         ]
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 async def resolve_run(info: Info, id: str) -> Optional[Run]:
@@ -73,7 +74,7 @@ async def resolve_run(info: Info, id: str) -> Optional[Run]:
             payload_json=r.get("payload_json"),
         )
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 async def resolve_trades(
@@ -119,7 +120,7 @@ async def resolve_trades(
             for r in rows
         ]
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 async def resolve_hypotheses(
@@ -159,7 +160,7 @@ async def resolve_hypotheses(
             for r in rows
         ]
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 async def resolve_similar_trades(info: Info, trade_id: int, limit: int = 10) -> list[Trade]:
@@ -233,7 +234,7 @@ KnowledgeEntry(
             for r in rows
         ]
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 async def resolve_meta_learner_stats(info: Info) -> MetaLearnerStats:
@@ -251,7 +252,7 @@ async def resolve_meta_learner_stats(info: Info) -> MetaLearnerStats:
             stats={"survival_count": survival, "rejection_count": rejection},
         )
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 async def resolve_reports(info: Info, limit: int = 20) -> list[AIReport]:
@@ -285,7 +286,7 @@ async def resolve_reports(info: Info, limit: int = 20) -> list[AIReport]:
             for r in rows
         ]
     finally:
-        conn.close()
+        put_conn(conn)
 
 
 async def resolve_report(info: Info, report_id: str) -> Optional[AIReport]:
@@ -317,81 +318,4 @@ async def resolve_report(info: Info, report_id: str) -> Optional[AIReport]:
             completed_at=str(r["completed_at"]) if r.get("completed_at") else None,
         )
     finally:
-        conn.close()
-
-
-async def resolve_generate_hypothesis(
-    info: Info,
-    context: HypothesisInput,
-) -> Optional[Hypothesis]:
-    _auth(info)
-    rlm_url = os.environ.get("RLM_SERVICE_URL", "http://localhost:8003").rstrip("/")
-    headers = {"Authorization": f"Bearer {RLM_AUTH_TOKEN}"} if RLM_AUTH_TOKEN else {}
-    payload = {
-        "regime_context": context.regime_context,
-        "prior_conclusions_summary": context.prior_conclusions_summary,
-        "generation": context.generation or 1,
-        "parent_hypothesis_id": context.parent_hypothesis_id,
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.post(f"{rlm_url}/hypotheses/generate", json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
-    except Exception:
-        return None
-    h = data.get("hypothesis") or (data if isinstance(data, dict) and data.get("hypothesis_id") else None)
-    if not h:
-        return None
-    return Hypothesis(
-        id=h.get("id", 0),
-        hypothesis_id=h.get("hypothesis_id", ""),
-        generation=h.get("generation", 1),
-        parent_hypothesis_id=h.get("parent_hypothesis_id"),
-        claim_text=h.get("claim_text", ""),
-        regime_context=h.get("regime_context"),
-        status=h.get("status", "pending"),
-        created_at=str(h.get("created_at", "")),
-        updated_at=str(h.get("updated_at", "")),
-    )
-
-
-async def resolve_submit_conclusion(
-    info: Info,
-    result_id: int,
-    verdict: str,
-) -> Optional[KnowledgeEntry]:
-    _auth(info)
-    if verdict not in ("supported", "rejected", "inconclusive"):
-        return None
-    conn = _db(info)
-    try:
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT hypothesis_id FROM experiment_results WHERE id = %s", (result_id,))
-        row = cur.fetchone()
-        if not row:
-            return None
-        hypothesis_id = row["hypothesis_id"]
-        cur.execute(
-            """INSERT INTO knowledge_store (hypothesis_id, result_id, verdict, confidence_score, survival_count, rejection_count)
-               VALUES (%s, %s, %s, 0.5, 0, 0)
-               RETURNING id, hypothesis_id, verdict, confidence_score, mutation_directive, regime_tags, survival_count, rejection_count, created_at""",
-            (hypothesis_id, result_id, verdict),
-        )
-        r = cur.fetchone()
-        conn.commit()
-        if not r:
-            return None
-        return KnowledgeEntry(
-            id=r["id"],
-            hypothesis_id=r["hypothesis_id"],
-            verdict=r["verdict"],
-            confidence_score=float(r["confidence_score"]) if r.get("confidence_score") is not None else None,
-            mutation_directive=r.get("mutation_directive"),
-            regime_tags=r.get("regime_tags"),
-            survival_count=r.get("survival_count") or 0,
-            rejection_count=r.get("rejection_count") or 0,
-            created_at=str(r["created_at"]) if r.get("created_at") else "",
-        )
-    finally:
-        conn.close()
+        put_conn(conn)
