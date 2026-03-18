@@ -51,12 +51,16 @@ class _FakeConn:
     ):
         self.cursor_obj = _FakeCursor(rows=rows, row=row, row_sequence=row_sequence)
         self.committed = False
+        self.rolled_back = False
 
     def cursor(self, cursor_factory=None):  # noqa: ANN001 - matches psycopg2 API
         return self.cursor_obj
 
     def commit(self) -> None:
         self.committed = True
+
+    def rollback(self) -> None:
+        self.rolled_back = True
 
 
 class _FakePool:
@@ -190,3 +194,67 @@ def test_search_runtime_logs_reads_runtime_log_rows(monkeypatch):
     assert response.status_code == 200
     body = response.json()
     assert body["runtimeLogs"][0]["message"] == "HTTP 401"
+
+
+def test_ensure_schema_v2_rebuilds_missing_derived_relations(monkeypatch, tmp_path):
+    schema_path = tmp_path / "schema_v2.sql"
+    schema_path.write_text("SELECT 1;")
+    fake_conn = _FakeConn()
+
+    def fake_execute(query: str, params: tuple | None = None) -> None:
+        fake_conn.cursor_obj.executed.append((query, params))
+        if "FROM pg_class" in query:
+            fake_conn.cursor_obj.rows = [
+                {"relname": "runs"},
+                {"relname": "events"},
+                {"relname": "state_snapshots"},
+                {"relname": "market_tape"},
+                {"relname": "decision_snapshots"},
+                {"relname": "order_lifecycle"},
+                {"relname": "completed_trades"},
+            ]
+        elif "FROM pg_attribute" in query:
+            fake_conn.cursor_obj.rows = []
+        else:
+            fake_conn.cursor_obj.rows = []
+
+    fake_conn.cursor_obj.execute = fake_execute
+
+    monkeypatch.setattr(analytics_app, "get_conn", lambda: fake_conn)
+    monkeypatch.setattr(analytics_app, "put_conn", lambda conn: None)
+    monkeypatch.setattr(analytics_app.os.path, "dirname", lambda _: str(tmp_path))
+
+    assert analytics_app.ensure_schema_v2() is True
+    assert fake_conn.committed is True
+    executed_sql = "\n".join(query for query, _ in fake_conn.cursor_obj.executed)
+    assert "DROP VIEW IF EXISTS v_run_timeline" in executed_sql
+    assert "DROP MATERIALIZED VIEW IF EXISTS mv_run_summaries" in executed_sql
+    assert "SELECT 1;" in executed_sql
+
+
+def test_ensure_schema_v2_defers_until_base_tables_exist(monkeypatch, tmp_path):
+    schema_path = tmp_path / "schema_v2.sql"
+    schema_path.write_text("SELECT 1;")
+    fake_conn = _FakeConn()
+
+    def fake_execute(query: str, params: tuple | None = None) -> None:
+        fake_conn.cursor_obj.executed.append((query, params))
+        if "FROM pg_class" in query:
+            fake_conn.cursor_obj.rows = [
+                {"relname": "runs"},
+                {"relname": "events"},
+            ]
+        else:
+            fake_conn.cursor_obj.rows = []
+
+    fake_conn.cursor_obj.execute = fake_execute
+
+    monkeypatch.setattr(analytics_app, "get_conn", lambda: fake_conn)
+    monkeypatch.setattr(analytics_app, "put_conn", lambda conn: None)
+    monkeypatch.setattr(analytics_app.os.path, "dirname", lambda _: str(tmp_path))
+
+    assert analytics_app.ensure_schema_v2() is False
+    assert fake_conn.committed is False
+    executed_sql = "\n".join(query for query, _ in fake_conn.cursor_obj.executed)
+    assert "DROP VIEW IF EXISTS v_run_timeline" not in executed_sql
+    assert "SELECT 1;" not in executed_sql

@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import os
 import logging
+import threading
+import time
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Optional, Generator
 
@@ -21,6 +23,55 @@ INTERNAL_API_TOKEN = (os.environ.get("GTRADE_INTERNAL_API_TOKEN") or "").strip()
 ANALYTICS_API_KEY = os.environ.get("ANALYTICS_API_KEY", "")
 
 _pool: ThreadedConnectionPool | None = None
+_schema_lock = threading.Lock()
+_schema_ready = False
+_last_mv_refresh_at = 0.0
+_MV_REFRESH_INTERVAL_SECONDS = 15.0
+_DERIVED_BASE_TABLES = (
+    "runs",
+    "events",
+    "state_snapshots",
+    "market_tape",
+    "decision_snapshots",
+    "order_lifecycle",
+    "completed_trades",
+)
+_REQUIRED_MV_RUN_SUMMARIES_COLUMNS = {
+    "run_id",
+    "created_at",
+    "last_seen_at",
+    "event_count",
+    "state_snapshot_count",
+    "decision_snapshot_count",
+    "market_tape_count",
+    "order_lifecycle_count",
+    "trade_count",
+    "runtime_log_count",
+    "total_pnl",
+    "latest_state_at",
+    "latest_decision_at",
+    "latest_market_at",
+    "latest_order_at",
+    "latest_runtime_log_at",
+    "latest_event_at",
+    "latest_trade_at",
+    "latest_blocker_at",
+}
+_REQUIRED_V_RUN_TIMELINE_COLUMNS = {
+    "run_id",
+    "timeline_at",
+    "kind",
+    "category",
+    "event_type",
+    "source",
+    "symbol",
+    "zone",
+    "action",
+    "reason",
+    "order_id",
+    "risk_state",
+    "payload_json",
+}
 
 
 def _get_pool() -> ThreadedConnectionPool:
@@ -119,18 +170,109 @@ def check_pool_health() -> dict[str, Any]:
     }
 
 
-def ensure_schema_v2() -> None:
+def _existing_relations(cur) -> dict[str, bool]:
+    cur.execute(
+        """
+        SELECT relname
+        FROM pg_class c
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = current_schema()
+          AND relname = ANY(%s)
+        """,
+        (
+            list(_DERIVED_BASE_TABLES) + ["mv_run_summaries", "mv_daily_trade_stats", "v_run_timeline"],
+        ),
+    )
+    return {row["relname"]: True for row in cur.fetchall()}
+
+
+def _relation_columns(cur, relation_name: str) -> set[str]:
+    cur.execute(
+        """
+        SELECT a.attname
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = current_schema()
+          AND c.relname = %s
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        """,
+        (relation_name,),
+    )
+    return {row["attname"] for row in cur.fetchall()}
+
+
+def _base_tables_ready(cur) -> bool:
+    relations = _existing_relations(cur)
+    if not all(relations.get(name) for name in _DERIVED_BASE_TABLES):
+        missing = [name for name in _DERIVED_BASE_TABLES if not relations.get(name)]
+        logger.info("Analytics schema ensure deferred; base tables not ready: %s", ", ".join(missing))
+        return False
+    return True
+
+
+def _derived_relations_ready(cur) -> bool:
+    relations = _existing_relations(cur)
+    if not relations.get("mv_run_summaries") or not relations.get("v_run_timeline"):
+        return False
+    mv_columns = _relation_columns(cur, "mv_run_summaries")
+    if not _REQUIRED_MV_RUN_SUMMARIES_COLUMNS.issubset(mv_columns):
+        return False
+    timeline_columns = _relation_columns(cur, "v_run_timeline")
+    if not _REQUIRED_V_RUN_TIMELINE_COLUMNS.issubset(timeline_columns):
+        return False
+    return True
+
+
+def _refresh_materialized_views(cur) -> None:
+    cur.execute("REFRESH MATERIALIZED VIEW mv_run_summaries")
+    cur.execute("REFRESH MATERIALIZED VIEW mv_daily_trade_stats")
+
+
+def ensure_schema_v2(force_recreate: bool = False) -> bool:
     """Apply RLM/analytics extension schema (hypotheses, experiments, knowledge_store, trade_embeddings, memory graph)."""
+    global _schema_ready, _last_mv_refresh_at
     schema_path = os.path.join(os.path.dirname(__file__), "schema_v2.sql")
     if not os.path.exists(schema_path):
-        return
-    conn = get_conn()
+        return False
+    with _schema_lock:
+        conn = get_conn()
+        try:
+            cur = conn.cursor(cursor_factory=RealDictCursor)
+            if not _base_tables_ready(cur):
+                return False
+            relations_ready = _derived_relations_ready(cur)
+            if not relations_ready or force_recreate:
+                cur.execute("DROP VIEW IF EXISTS v_run_timeline")
+                cur.execute("DROP MATERIALIZED VIEW IF EXISTS mv_daily_trade_stats")
+                cur.execute("DROP MATERIALIZED VIEW IF EXISTS mv_run_summaries")
+                with open(schema_path) as f:
+                    cur.execute(f.read())
+                conn.commit()
+                _schema_ready = True
+                _last_mv_refresh_at = time.monotonic()
+                logger.info("Analytics derived schema rebuilt")
+                return True
+            now = time.monotonic()
+            if now - _last_mv_refresh_at >= _MV_REFRESH_INTERVAL_SECONDS:
+                _refresh_materialized_views(cur)
+                conn.commit()
+                _last_mv_refresh_at = now
+            _schema_ready = True
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            put_conn(conn)
+
+
+def ensure_derived_read_models(force_recreate: bool = False) -> None:
     try:
-        with open(schema_path) as f:
-            conn.cursor().execute(f.read())
-        conn.commit()
-    finally:
-        put_conn(conn)
+        ensure_schema_v2(force_recreate=force_recreate)
+    except Exception as exc:
+        logger.warning("Derived analytics schema ensure failed: %s", exc)
 
 
 def _bearer_ok(authorization: str | None) -> bool:
@@ -153,7 +295,7 @@ def _require_graphql_auth(authorization: str | None = Header(None)) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     try:
-        ensure_schema_v2()
+        ensure_derived_read_models()
     except Exception as e:
         logger.warning("Startup schema_v2 ensure failed: %s", e)
     yield
@@ -169,6 +311,7 @@ async def list_runs(
     search: Optional[str] = None,
 ):
     _require_auth(authorization)
+    ensure_derived_read_models()
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -215,6 +358,7 @@ async def compare_runs(
     right_run_id: str = Query(...),
 ):
     _require_auth(authorization)
+    ensure_derived_read_models()
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -251,6 +395,7 @@ async def get_run(
     authorization: str | None = Header(None),
 ):
     _require_auth(authorization)
+    ensure_derived_read_models()
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -592,6 +737,7 @@ async def search_runs(
     limit: int = Query(25, ge=1, le=100),
 ):
     _require_auth(authorization)
+    ensure_derived_read_models()
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -684,6 +830,7 @@ async def run_timeline(
     limit: int = Query(400, ge=1, le=1000),
 ):
     _require_auth(authorization)
+    ensure_derived_read_models()
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -764,6 +911,7 @@ async def analytics_summary(
     authorization: str | None = Header(None),
 ):
     _require_auth(authorization)
+    ensure_derived_read_models()
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
