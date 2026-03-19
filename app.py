@@ -40,6 +40,10 @@ _REQUIRED_MV_RUN_SUMMARIES_COLUMNS = {
     "run_id",
     "created_at",
     "last_seen_at",
+    "account_id",
+    "account_name",
+    "account_mode",
+    "account_is_practice",
     "event_count",
     "state_snapshot_count",
     "decision_snapshot_count",
@@ -320,6 +324,7 @@ async def list_runs(
                 """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
                           position, position_pnl, daily_pnl, risk_state, event_count, state_snapshot_count,
                           decision_snapshot_count, market_tape_count, order_lifecycle_count, trade_count, total_pnl,
+                          account_id, account_name, account_mode, account_is_practice,
                           latest_state_at, latest_decision_at, latest_market_at, latest_order_at, latest_event_at,
                           latest_trade_at, latest_blocker_at
                    FROM mv_run_summaries
@@ -329,15 +334,17 @@ async def list_runs(
                       OR zone ILIKE %s
                       OR risk_state ILIKE %s
                       OR symbol ILIKE %s
+                      OR account_name ILIKE %s
                    ORDER BY COALESCE(last_seen_at, created_at) DESC
                    LIMIT %s""",
-                (f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", limit),
+                (f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%", limit),
             )
         else:
             cur.execute(
                 """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
                           position, position_pnl, daily_pnl, risk_state, event_count, state_snapshot_count,
                           decision_snapshot_count, market_tape_count, order_lifecycle_count, trade_count, total_pnl,
+                          account_id, account_name, account_mode, account_is_practice,
                           latest_state_at, latest_decision_at, latest_market_at, latest_order_at, latest_event_at,
                           latest_trade_at, latest_blocker_at
                    FROM mv_run_summaries
@@ -401,7 +408,8 @@ async def get_run(
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
             """SELECT r.run_id, r.created_at, r.last_seen_at, r.process_id, r.data_mode, r.symbol, r.status, r.zone,
-                      r.zone_state, r.position, r.position_pnl, r.daily_pnl, r.risk_state, r.last_signal_json,
+                      r.zone_state, r.position, r.position_pnl, r.daily_pnl, r.risk_state, r.account_id, r.account_name,
+                      r.account_mode, r.account_is_practice, r.last_signal_json,
                       r.last_entry_block_reason, r.execution_json, r.heartbeat_json, r.lifecycle_json, r.payload_json,
                       s.event_count, s.state_snapshot_count, s.decision_snapshot_count, s.market_tape_count,
                       s.order_lifecycle_count, s.trade_count, s.total_pnl, s.latest_state_at, s.latest_decision_at,
@@ -489,7 +497,8 @@ async def run_trades(
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
             """SELECT id, run_id, inserted_at, entry_time, exit_time, direction, contracts, entry_price, exit_price, pnl,
-                      zone, strategy, regime, event_tags_json, source, backfilled, payload_json
+                      zone, strategy, regime, event_tags_json, source, backfilled, trade_id, position_id, decision_id,
+                      attempt_id, account_id, account_name, account_mode, account_is_practice, payload_json
                FROM completed_trades
                WHERE run_id = %s
                ORDER BY COALESCE(exit_time, inserted_at) DESC, id DESC
@@ -514,7 +523,8 @@ async def run_state_snapshots(
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
             """SELECT id, run_id, captured_at, status, data_mode, symbol, zone, zone_state, position, position_pnl,
-                      daily_pnl, risk_state, last_signal_json, last_entry_reason, last_entry_block_reason, decision_price,
+                      daily_pnl, risk_state, account_id, account_name, account_mode, account_is_practice,
+                      last_signal_json, last_entry_reason, last_entry_block_reason, decision_price,
                       entry_guard_json, unresolved_entry_json, execution_json, heartbeat_json, lifecycle_json,
                       observability_json, payload_json
                FROM state_snapshots
@@ -683,7 +693,8 @@ async def run_manifest(
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, config_path, config_hash,
+            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, account_id, account_name,
+                      account_mode, account_is_practice, config_path, config_hash,
                       log_path, sqlite_path, git_commit, git_branch, git_dirty, git_available, app_version, payload_json
                FROM run_manifests
                WHERE run_id = %s""",
@@ -693,6 +704,101 @@ async def run_manifest(
         if not row:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run manifest not found")
         return dict(row)
+    finally:
+        put_conn(conn)
+
+
+@app.get("/accounts")
+async def account_summaries(
+    authorization: str | None = Header(None),
+    limit: int = Query(20, ge=1, le=100),
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute(
+            """
+            WITH runs_agg AS (
+                SELECT
+                    account_id,
+                    MAX(account_name) AS account_name,
+                    MAX(account_mode) AS account_mode,
+                    BOOL_OR(COALESCE(account_is_practice, false)) AS account_is_practice,
+                    COUNT(*) AS run_count,
+                    MAX(last_seen_at) AS latest_run_seen_at
+                FROM runs
+                WHERE account_id IS NOT NULL
+                GROUP BY account_id
+            ),
+            trade_agg AS (
+                SELECT
+                    account_id,
+                    MAX(account_name) AS account_name,
+                    MAX(account_mode) AS account_mode,
+                    BOOL_OR(COALESCE(account_is_practice, false)) AS account_is_practice,
+                    COUNT(*) AS trade_count,
+                    COALESCE(SUM(profit_and_loss), 0) AS realized_pnl,
+                    MAX(occurred_at) AS latest_trade_at
+                FROM account_trades
+                GROUP BY account_id
+            )
+            SELECT
+                COALESCE(r.account_id, t.account_id) AS account_id,
+                COALESCE(r.account_name, t.account_name) AS account_name,
+                COALESCE(r.account_mode, t.account_mode) AS account_mode,
+                COALESCE(r.account_is_practice, t.account_is_practice) AS account_is_practice,
+                COALESCE(r.run_count, 0) AS run_count,
+                COALESCE(t.trade_count, 0) AS trade_count,
+                COALESCE(t.realized_pnl, 0) AS realized_pnl,
+                t.latest_trade_at,
+                r.latest_run_seen_at
+            FROM runs_agg r
+            FULL OUTER JOIN trade_agg t ON t.account_id = r.account_id
+            ORDER BY COALESCE(t.latest_trade_at, r.latest_run_seen_at) DESC
+            LIMIT %s
+            """,
+            (limit,),
+        )
+        return {"accounts": [dict(row) for row in cur.fetchall()]}
+    finally:
+        put_conn(conn)
+
+
+@app.get("/account-trades")
+async def account_trades(
+    authorization: str | None = Header(None),
+    limit: int = Query(100, ge=1, le=500),
+    account_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+):
+    _require_auth(authorization)
+    conn = get_conn()
+    try:
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id:
+            clauses.append("account_id = %s")
+            params.append(account_id)
+        if run_id:
+            clauses.append("run_id = %s")
+            params.append(run_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        cur.execute(
+            f"""
+            SELECT id, run_id, inserted_at, occurred_at, account_id, account_name, account_mode, account_is_practice,
+                   broker_trade_id, broker_order_id, contract_id, side, size, price, profit_and_loss, fees,
+                   voided, source, payload_json
+            FROM account_trades
+            {where}
+            ORDER BY occurred_at DESC, id DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        return {"accountTrades": [dict(row) for row in cur.fetchall()]}
     finally:
         put_conn(conn)
 
@@ -745,14 +851,15 @@ async def search_runs(
             """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
                       position, position_pnl, daily_pnl, risk_state, event_count, state_snapshot_count,
                       decision_snapshot_count, market_tape_count, order_lifecycle_count, trade_count, total_pnl,
+                      account_id, account_name, account_mode, account_is_practice,
                       latest_state_at, latest_decision_at, latest_market_at, latest_order_at, latest_event_at,
                       latest_trade_at, latest_blocker_at
                FROM mv_run_summaries
                WHERE run_id ILIKE %s OR data_mode ILIKE %s OR status ILIKE %s OR zone ILIKE %s OR risk_state ILIKE %s
-                  OR symbol ILIKE %s
+                  OR symbol ILIKE %s OR account_name ILIKE %s
                ORDER BY COALESCE(last_seen_at, created_at) DESC
                LIMIT %s""",
-            (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", limit),
+            (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%", limit),
         )
         rows = cur.fetchall()
         return {"runs": [dict(r) for r in rows]}

@@ -12,9 +12,14 @@ import strawberry
 class Run:
     run_id: str
     created_at: str
+    last_seen_at: Optional[str]
     process_id: Optional[int]
     data_mode: Optional[str]
     symbol: Optional[str]
+    account_id: Optional[str]
+    account_name: Optional[str]
+    account_mode: Optional[str]
+    account_is_practice: Optional[bool]
     payload_json: Optional[strawberry.scalars.JSON]
 
 
@@ -22,6 +27,7 @@ class Run:
 class Trade:
     id: int
     run_id: str
+    inserted_at: Optional[str]
     entry_time: Optional[str]
     exit_time: Optional[str]
     direction: int
@@ -34,6 +40,14 @@ class Trade:
     regime: Optional[str]
     source: Optional[str]
     backfilled: Optional[bool]
+    trade_id: Optional[str]
+    position_id: Optional[str]
+    decision_id: Optional[str]
+    attempt_id: Optional[str]
+    account_id: Optional[str]
+    account_name: Optional[str]
+    account_mode: Optional[str]
+    account_is_practice: Optional[bool]
     payload_json: Optional[strawberry.scalars.JSON]
 
 

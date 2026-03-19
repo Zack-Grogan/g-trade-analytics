@@ -34,7 +34,11 @@ async def resolve_runs(info: Info, limit: int = 25) -> list[Run]:
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            "SELECT run_id, created_at, process_id, data_mode, symbol, payload_json FROM runs ORDER BY created_at DESC LIMIT %s",
+            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol,
+                      account_id, account_name, account_mode, account_is_practice, payload_json
+               FROM runs
+               ORDER BY created_at DESC
+               LIMIT %s""",
             (limit,),
         )
         rows = cur.fetchall()
@@ -42,9 +46,14 @@ async def resolve_runs(info: Info, limit: int = 25) -> list[Run]:
             Run(
                 run_id=r["run_id"],
                 created_at=str(r["created_at"]) if r.get("created_at") else "",
+                last_seen_at=str(r["last_seen_at"]) if r.get("last_seen_at") else None,
                 process_id=r.get("process_id"),
                 data_mode=r.get("data_mode"),
                 symbol=r.get("symbol"),
+                account_id=r.get("account_id"),
+                account_name=r.get("account_name"),
+                account_mode=r.get("account_mode"),
+                account_is_practice=r.get("account_is_practice"),
                 payload_json=r.get("payload_json"),
             )
             for r in rows
@@ -59,7 +68,10 @@ async def resolve_run(info: Info, id: str) -> Optional[Run]:
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
         cur.execute(
-            "SELECT run_id, created_at, process_id, data_mode, symbol, payload_json FROM runs WHERE run_id = %s",
+            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol,
+                      account_id, account_name, account_mode, account_is_practice, payload_json
+               FROM runs
+               WHERE run_id = %s""",
             (id,),
         )
         r = cur.fetchone()
@@ -68,9 +80,14 @@ async def resolve_run(info: Info, id: str) -> Optional[Run]:
         return Run(
             run_id=r["run_id"],
             created_at=str(r["created_at"]) if r.get("created_at") else "",
+            last_seen_at=str(r["last_seen_at"]) if r.get("last_seen_at") else None,
             process_id=r.get("process_id"),
             data_mode=r.get("data_mode"),
             symbol=r.get("symbol"),
+            account_id=r.get("account_id"),
+            account_name=r.get("account_name"),
+            account_mode=r.get("account_mode"),
+            account_is_practice=r.get("account_is_practice"),
             payload_json=r.get("payload_json"),
         )
     finally:
@@ -88,23 +105,28 @@ async def resolve_trades(
         cur = conn.cursor(cursor_factory=RealDictCursor)
         if run_id:
             cur.execute(
-                """SELECT id, run_id, entry_time, exit_time, direction, contracts, entry_price, exit_price, pnl, zone, strategy, regime, source, backfilled, payload_json
+                """SELECT id, run_id, inserted_at, entry_time, exit_time, direction, contracts, entry_price, exit_price, pnl,
+                          zone, strategy, regime, source, backfilled, trade_id, position_id, decision_id, attempt_id,
+                          account_id, account_name, account_mode, account_is_practice, payload_json
                    FROM completed_trades WHERE run_id = %s ORDER BY exit_time DESC LIMIT %s""",
                 (run_id, limit),
             )
         else:
             cur.execute(
-                """SELECT id, run_id, entry_time, exit_time, direction, contracts, entry_price, exit_price, pnl, zone, strategy, regime, source, backfilled, payload_json
+                """SELECT id, run_id, inserted_at, entry_time, exit_time, direction, contracts, entry_price, exit_price, pnl,
+                          zone, strategy, regime, source, backfilled, trade_id, position_id, decision_id, attempt_id,
+                          account_id, account_name, account_mode, account_is_practice, payload_json
                    FROM completed_trades ORDER BY exit_time DESC LIMIT %s""",
                 (limit,),
             )
         rows = cur.fetchall()
         return [
-            Trade(
-                id=r["id"],
-                run_id=r["run_id"],
-                entry_time=str(r["entry_time"]) if r.get("entry_time") else None,
-                exit_time=str(r["exit_time"]) if r.get("exit_time") else None,
+                Trade(
+                    id=r["id"],
+                    run_id=r["run_id"],
+                    inserted_at=str(r["inserted_at"]) if r.get("inserted_at") else None,
+                    entry_time=str(r["entry_time"]) if r.get("entry_time") else None,
+                    exit_time=str(r["exit_time"]) if r.get("exit_time") else None,
                 direction=r["direction"],
                 contracts=r["contracts"],
                 entry_price=float(r["entry_price"]),
@@ -112,11 +134,19 @@ async def resolve_trades(
                 pnl=float(r["pnl"]),
                 zone=r.get("zone"),
                 strategy=r.get("strategy"),
-                regime=r.get("regime"),
-                source=r.get("source"),
-                backfilled=r.get("backfilled"),
-                payload_json=r.get("payload_json"),
-            )
+                    regime=r.get("regime"),
+                    source=r.get("source"),
+                    backfilled=r.get("backfilled"),
+                    trade_id=r.get("trade_id"),
+                    position_id=r.get("position_id"),
+                    decision_id=r.get("decision_id"),
+                    attempt_id=r.get("attempt_id"),
+                    account_id=r.get("account_id"),
+                    account_name=r.get("account_name"),
+                    account_mode=r.get("account_mode"),
+                    account_is_practice=r.get("account_is_practice"),
+                    payload_json=r.get("payload_json"),
+                )
             for r in rows
         ]
     finally:
@@ -179,6 +209,7 @@ async def resolve_similar_trades(info: Info, trade_id: int, limit: int = 10) -> 
         Trade(
             id=t["id"],
             run_id=t["run_id"],
+            inserted_at=str(t["inserted_at"]) if t.get("inserted_at") else None,
             entry_time=str(t["entry_time"]) if t.get("entry_time") else None,
             exit_time=str(t["exit_time"]) if t.get("exit_time") else None,
             direction=t["direction"],
@@ -191,6 +222,14 @@ async def resolve_similar_trades(info: Info, trade_id: int, limit: int = 10) -> 
             regime=t.get("regime"),
             source=t.get("source"),
             backfilled=t.get("backfilled"),
+            trade_id=t.get("trade_id"),
+            position_id=t.get("position_id"),
+            decision_id=t.get("decision_id"),
+            attempt_id=t.get("attempt_id"),
+            account_id=t.get("account_id"),
+            account_name=t.get("account_name"),
+            account_mode=t.get("account_mode"),
+            account_is_practice=t.get("account_is_practice"),
             payload_json=t.get("payload_json"),
         )
         for t in similar
