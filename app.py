@@ -198,6 +198,50 @@ def _trade_review_summary(trade: dict[str, Any]) -> str:
     )
 
 
+def _trade_direction_from_account_side(side: Any) -> int:
+    try:
+        value = int(side)
+    except (TypeError, ValueError):
+        return 0
+    if value > 0:
+        return 1
+    if value == 0:
+        return -1
+    return value
+
+
+def _synthesize_trade_from_account_trade(row: dict[str, Any]) -> dict[str, Any]:
+    occurred_at = row.get("occurred_at") or row.get("inserted_at")
+    direction = _trade_direction_from_account_side(row.get("side"))
+    return {
+        "id": row.get("id"),
+        "run_id": row.get("run_id"),
+        "inserted_at": row.get("inserted_at") or occurred_at,
+        "entry_time": occurred_at,
+        "exit_time": occurred_at,
+        "direction": direction,
+        "contracts": row.get("size") or 0,
+        "entry_price": row.get("price") or 0,
+        "exit_price": row.get("price") or 0,
+        "pnl": row.get("profit_and_loss") or 0,
+        "zone": row.get("contract_id"),
+        "strategy": row.get("source"),
+        "regime": None,
+        "event_tags_json": None,
+        "source": row.get("source"),
+        "backfilled": True,
+        "trade_id": row.get("broker_trade_id") or row.get("id"),
+        "position_id": row.get("broker_order_id"),
+        "decision_id": None,
+        "attempt_id": None,
+        "account_id": row.get("account_id"),
+        "account_name": row.get("account_name"),
+        "account_mode": row.get("account_mode"),
+        "account_is_practice": row.get("account_is_practice"),
+        "payload_json": row.get("payload_json"),
+    }
+
+
 def _trade_marker(trade: dict[str, Any], kind: str) -> dict[str, Any]:
     time_key = "entry_time" if kind == "entry" else "exit_time"
     price_key = "entry_price" if kind == "entry" else "exit_price"
@@ -1640,13 +1684,14 @@ def _build_trade_review_analysis(
     }
 
 
-@app.get("/trades/{trade_id}")
+@app.get("/trades/{trade_ref}")
 async def trade_review(
-    trade_id: int,
+    trade_ref: str,
     authorization: str | None = Header(None),
     limit: int = Query(200, ge=1, le=1000),
 ):
     _require_auth(authorization)
+    trade_lookup = trade_ref.strip()
     conn = get_conn()
     try:
         cur = conn.cursor(cursor_factory=RealDictCursor)
@@ -1655,154 +1700,212 @@ async def trade_review(
                       zone, strategy, regime, event_tags_json, source, backfilled, trade_id, position_id, decision_id,
                       attempt_id, account_id, account_name, account_mode, account_is_practice, payload_json
                FROM completed_trades
-               WHERE id = %s""",
-            (trade_id,),
+               WHERE id::text = %s
+                  OR trade_id = %s
+                  OR position_id = %s
+               ORDER BY exit_time DESC NULLS LAST, inserted_at DESC NULLS LAST, id DESC
+               LIMIT 1""",
+            (trade_lookup, trade_lookup, trade_lookup),
         )
         trade = cur.fetchone()
-        if not trade:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trade not found")
+        account_trade = None
+        if trade:
+            trade_dict = dict(trade)
+        else:
+            cur.execute(
+                """SELECT id, run_id, inserted_at, occurred_at, account_id, account_name, account_mode, account_is_practice,
+                          broker_trade_id, broker_order_id, contract_id, side, size, price, profit_and_loss, fees,
+                          voided, source, payload_json
+                   FROM account_trades
+                   WHERE id::text = %s
+                      OR broker_trade_id = %s
+                      OR broker_order_id = %s
+                      OR contract_id = %s
+                   ORDER BY occurred_at DESC, id DESC
+                   LIMIT 1""",
+                (trade_lookup, trade_lookup, trade_lookup, trade_lookup),
+            )
+            account_trade = cur.fetchone()
+            if not account_trade:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Trade not found")
+            trade_dict = _synthesize_trade_from_account_trade(dict(account_trade))
 
-        trade_dict = dict(trade)
         run_id = trade_dict.get("run_id")
-        cur.execute(
-            """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
-                      position, position_pnl, daily_pnl, risk_state, account_id, account_name, account_mode,
-                      account_is_practice, last_signal_json, last_entry_block_reason, execution_json, heartbeat_json,
-                      lifecycle_json, payload_json
-               FROM runs
-               WHERE run_id = %s""",
-            (run_id,),
-        )
-        run = cur.fetchone()
-        if not run:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Run not found for trade")
-        run_dict = dict(run)
+        run_dict: dict[str, Any] | None = None
+        if run_id:
+            cur.execute(
+                """SELECT run_id, created_at, last_seen_at, process_id, data_mode, symbol, status, zone, zone_state,
+                          position, position_pnl, daily_pnl, risk_state, account_id, account_name, account_mode,
+                          account_is_practice, last_signal_json, last_entry_block_reason, execution_json, heartbeat_json,
+                          lifecycle_json, payload_json
+                   FROM runs
+                   WHERE run_id = %s""",
+                (run_id,),
+            )
+            run = cur.fetchone()
+            if run:
+                run_dict = dict(run)
+
+        if run_dict is None and account_trade is not None:
+            run_dict = {
+                "run_id": run_id or f"account-trade-{trade_dict.get('trade_id')}",
+                "created_at": trade_dict.get("inserted_at"),
+                "last_seen_at": trade_dict.get("exit_time") or trade_dict.get("inserted_at"),
+                "process_id": None,
+                "data_mode": trade_dict.get("account_mode"),
+                "symbol": trade_dict.get("zone") or trade_dict.get("payload_json", {}).get("symbol") if isinstance(trade_dict.get("payload_json"), dict) else None,
+                "status": "backfilled",
+                "zone": trade_dict.get("zone"),
+                "zone_state": "backfilled",
+                "position": None,
+                "position_pnl": None,
+                "daily_pnl": None,
+                "risk_state": "backfilled",
+                "account_id": trade_dict.get("account_id"),
+                "account_name": trade_dict.get("account_name"),
+                "account_mode": trade_dict.get("account_mode"),
+                "account_is_practice": trade_dict.get("account_is_practice"),
+                "last_signal_json": None,
+                "last_entry_block_reason": None,
+                "execution_json": None,
+                "heartbeat_json": None,
+                "lifecycle_json": None,
+                "payload_json": trade_dict.get("payload_json"),
+            }
 
         entry_time = _parse_dt(trade_dict.get("entry_time") or trade_dict.get("inserted_at"))
         exit_time = _parse_dt(trade_dict.get("exit_time") or trade_dict.get("entry_time") or trade_dict.get("inserted_at"))
         market_limit = min(max(limit, 100), 1000)
         window_start, window_end = _trade_window_bounds(trade_dict, padding_minutes=10)
-        if entry_time and exit_time:
-            market_start = entry_time - timedelta(minutes=10)
-            market_end = exit_time + timedelta(minutes=10)
+        market_tape: list[dict[str, Any]] = []
+        decision_snapshots: list[dict[str, Any]] = []
+        state_snapshots: list[dict[str, Any]] = []
+        order_lifecycle: list[dict[str, Any]] = []
+        events: list[dict[str, Any]] = []
+        timeline: list[dict[str, Any]] = []
+        blockers: list[dict[str, Any]] = []
+
+        if run_id:
+            if entry_time and exit_time:
+                market_start = entry_time - timedelta(minutes=10)
+                market_end = exit_time + timedelta(minutes=10)
+                cur.execute(
+                    """SELECT id, run_id, captured_at, inserted_at, process_id, symbol, contract_id, bid, ask, last, volume,
+                              bid_size, ask_size, last_size, volume_is_cumulative, quote_is_synthetic, trade_side, latency_ms,
+                              source, sequence, payload_json
+                       FROM market_tape
+                       WHERE run_id = %s
+                         AND captured_at BETWEEN %s AND %s
+                       ORDER BY captured_at ASC, id ASC
+                       LIMIT %s""",
+                    (run_id, market_start, market_end, market_limit),
+                )
+            else:
+                cur.execute(
+                    """SELECT id, run_id, captured_at, inserted_at, process_id, symbol, contract_id, bid, ask, last, volume,
+                              bid_size, ask_size, last_size, volume_is_cumulative, quote_is_synthetic, trade_side, latency_ms,
+                              source, sequence, payload_json
+                       FROM market_tape
+                       WHERE run_id = %s
+                       ORDER BY captured_at DESC, id DESC
+                       LIMIT %s""",
+                    (run_id, market_limit),
+                )
+            market_tape = [dict(row) for row in cur.fetchall()]
+
             cur.execute(
-                """SELECT id, run_id, captured_at, inserted_at, process_id, symbol, contract_id, bid, ask, last, volume,
-                          bid_size, ask_size, last_size, volume_is_cumulative, quote_is_synthetic, trade_side, latency_ms,
-                          source, sequence, payload_json
-                   FROM market_tape
+                """SELECT id, run_id, decided_at, inserted_at, decision_id, attempt_id, process_id, symbol, zone,
+                          action, reason, outcome, outcome_reason, long_score, short_score, flat_bias, score_gap,
+                          dominant_side, current_price, allow_entries, execution_tradeable, contracts, order_type,
+                          limit_price, decision_price, side, stop_loss, take_profit, max_hold_minutes, regime_state,
+                          regime_reason, active_session, active_vetoes_json, feature_snapshot_json, entry_guard_json,
+                          unresolved_entry_json, event_context_json, order_flow_json, payload_json
+                   FROM decision_snapshots
                    WHERE run_id = %s
-                     AND captured_at BETWEEN %s AND %s
-                   ORDER BY captured_at ASC, id ASC
+                   ORDER BY decided_at DESC, id DESC
                    LIMIT %s""",
-                (run_id, market_start, market_end, market_limit),
+                (run_id, market_limit),
             )
-        else:
+            decision_snapshots = [dict(row) for row in cur.fetchall()]
+
             cur.execute(
-                """SELECT id, run_id, captured_at, inserted_at, process_id, symbol, contract_id, bid, ask, last, volume,
-                          bid_size, ask_size, last_size, volume_is_cumulative, quote_is_synthetic, trade_side, latency_ms,
-                          source, sequence, payload_json
-                   FROM market_tape
+                """SELECT id, run_id, captured_at, status, data_mode, symbol, zone, zone_state, position, position_pnl,
+                          daily_pnl, risk_state, account_id, account_name, account_mode, account_is_practice,
+                          last_signal_json, last_entry_reason, last_entry_block_reason, decision_price,
+                          entry_guard_json, unresolved_entry_json, execution_json, heartbeat_json, lifecycle_json,
+                          observability_json, payload_json
+                   FROM state_snapshots
                    WHERE run_id = %s
                    ORDER BY captured_at DESC, id DESC
                    LIMIT %s""",
                 (run_id, market_limit),
             )
-        market_tape = [dict(row) for row in cur.fetchall()]
+            state_snapshots = [dict(row) for row in cur.fetchall()]
 
-        cur.execute(
-            """SELECT id, run_id, decided_at, inserted_at, decision_id, attempt_id, process_id, symbol, zone,
-                      action, reason, outcome, outcome_reason, long_score, short_score, flat_bias, score_gap,
-                      dominant_side, current_price, allow_entries, execution_tradeable, contracts, order_type,
-                      limit_price, decision_price, side, stop_loss, take_profit, max_hold_minutes, regime_state,
-                      regime_reason, active_session, active_vetoes_json, feature_snapshot_json, entry_guard_json,
-                      unresolved_entry_json, event_context_json, order_flow_json, payload_json
-               FROM decision_snapshots
-               WHERE run_id = %s
-               ORDER BY decided_at DESC, id DESC
-               LIMIT %s""",
-            (run_id, market_limit),
-        )
-        decision_snapshots = [dict(row) for row in cur.fetchall()]
+            lifecycle_related: list[str] = []
+            lifecycle_params: list[Any] = [run_id]
+            for key in ("trade_id", "decision_id", "position_id"):
+                value = trade_dict.get(key)
+                if value:
+                    lifecycle_related.append(f"{key} = %s")
+                    lifecycle_params.append(value)
+            lifecycle_params.append(market_limit)
+            lifecycle_where = "run_id = %s"
+            if lifecycle_related:
+                lifecycle_where = f"run_id = %s AND ({' OR '.join(lifecycle_related)})"
+            cur.execute(
+                f"""SELECT id, run_id, observed_at, inserted_at, decision_id, attempt_id, order_id, position_id, trade_id,
+                          process_id, symbol, event_type, status, side, role, is_protective, order_type, quantity, contracts,
+                          limit_price, stop_price, expected_fill_price, filled_price, filled_quantity, remaining_quantity,
+                          zone, reason, lifecycle_state, payload_json
+                   FROM order_lifecycle
+                   WHERE {lifecycle_where}
+                   ORDER BY observed_at DESC, id DESC
+                   LIMIT %s""",
+                tuple(lifecycle_params),
+            )
+            order_lifecycle = [dict(row) for row in cur.fetchall()]
+            order_ids = [row.get("order_id") for row in order_lifecycle if row.get("order_id")]
 
-        cur.execute(
-            """SELECT id, run_id, captured_at, status, data_mode, symbol, zone, zone_state, position, position_pnl,
-                      daily_pnl, risk_state, account_id, account_name, account_mode, account_is_practice,
-                      last_signal_json, last_entry_reason, last_entry_block_reason, decision_price,
-                      entry_guard_json, unresolved_entry_json, execution_json, heartbeat_json, lifecycle_json,
-                      observability_json, payload_json
-               FROM state_snapshots
-               WHERE run_id = %s
-               ORDER BY captured_at DESC, id DESC
-               LIMIT %s""",
-            (run_id, market_limit),
-        )
-        state_snapshots = [dict(row) for row in cur.fetchall()]
+            event_clauses = ["run_id = %s"]
+            event_params: list[Any] = [run_id]
+            if entry_time and exit_time:
+                event_clauses.append("event_timestamp BETWEEN %s AND %s")
+                event_params.extend([entry_time - timedelta(minutes=10), exit_time + timedelta(minutes=10)])
+            if order_ids:
+                event_clauses.append("order_id = ANY(%s)")
+                event_params.append(order_ids)
+            event_params.append(market_limit)
+            cur.execute(
+                f"""SELECT id, run_id, event_timestamp, inserted_at, category, event_type, source, symbol, zone, action,
+                           reason, order_id, risk_state, contracts, order_status, guard_reason, decision_side, decision_price,
+                           expected_fill_price, entry_guard_json, unresolved_entry_json, execution_json, payload_json
+                    FROM events
+                    WHERE {' AND '.join(event_clauses)}
+                    ORDER BY event_timestamp DESC, id DESC
+                    LIMIT %s""",
+                tuple(event_params),
+            )
+            events = [dict(row) for row in cur.fetchall()]
 
-        lifecycle_related: list[str] = []
-        lifecycle_params: list[Any] = [run_id]
-        for key in ("trade_id", "decision_id", "position_id"):
-            value = trade_dict.get(key)
-            if value:
-                lifecycle_related.append(f"{key} = %s")
-                lifecycle_params.append(value)
-        lifecycle_params.append(market_limit)
-        lifecycle_where = "run_id = %s"
-        if lifecycle_related:
-            lifecycle_where = f"run_id = %s AND ({' OR '.join(lifecycle_related)})"
-        cur.execute(
-            f"""SELECT id, run_id, observed_at, inserted_at, decision_id, attempt_id, order_id, position_id, trade_id,
-                      process_id, symbol, event_type, status, side, role, is_protective, order_type, quantity, contracts,
-                      limit_price, stop_price, expected_fill_price, filled_price, filled_quantity, remaining_quantity,
-                      zone, reason, lifecycle_state, payload_json
-               FROM order_lifecycle
-               WHERE {lifecycle_where}
-               ORDER BY observed_at DESC, id DESC
-               LIMIT %s""",
-            tuple(lifecycle_params),
-        )
-        order_lifecycle = [dict(row) for row in cur.fetchall()]
-        order_ids = [row.get("order_id") for row in order_lifecycle if row.get("order_id")]
-
-        event_clauses = ["run_id = %s"]
-        event_params: list[Any] = [run_id]
-        if entry_time and exit_time:
-            event_clauses.append("event_timestamp BETWEEN %s AND %s")
-            event_params.extend([entry_time - timedelta(minutes=10), exit_time + timedelta(minutes=10)])
-        if order_ids:
-            event_clauses.append("order_id = ANY(%s)")
-            event_params.append(order_ids)
-        event_params.append(market_limit)
-        cur.execute(
-            f"""SELECT id, run_id, event_timestamp, inserted_at, category, event_type, source, symbol, zone, action,
-                       reason, order_id, risk_state, contracts, order_status, guard_reason, decision_side, decision_price,
-                       expected_fill_price, entry_guard_json, unresolved_entry_json, execution_json, payload_json
-                FROM events
-                WHERE {' AND '.join(event_clauses)}
-                ORDER BY event_timestamp DESC, id DESC
-                LIMIT %s""",
-            tuple(event_params),
-        )
-        events = [dict(row) for row in cur.fetchall()]
-
-        cur.execute(
-            """SELECT *
-               FROM v_run_timeline
-               WHERE run_id = %s
-               ORDER BY timeline_at DESC
-               LIMIT %s""",
-            (run_id, market_limit),
-        )
-        timeline_rows = [dict(row) for row in cur.fetchall()]
-        timeline: list[dict[str, Any]] = []
-        for row in timeline_rows:
-            item = dict(row)
-            item["timestamp"] = _iso(item.get("timeline_at"))
-            timeline.append(item)
-        blockers = _timeline_blockers(timeline)
+            cur.execute(
+                """SELECT *
+                   FROM v_run_timeline
+                   WHERE run_id = %s
+                   ORDER BY timeline_at DESC
+                   LIMIT %s""",
+                (run_id, market_limit),
+            )
+            timeline_rows = [dict(row) for row in cur.fetchall()]
+            for row in timeline_rows:
+                item = dict(row)
+                item["timestamp"] = _iso(item.get("timeline_at"))
+                timeline.append(item)
+            blockers = _timeline_blockers(timeline)
 
         analysis = _build_trade_review_analysis(
             trade=trade_dict,
-            run=run_dict,
+            run=run_dict or {},
             market_tape=market_tape,
             decision_snapshots=decision_snapshots,
             state_snapshots=state_snapshots,
@@ -1816,10 +1919,10 @@ async def trade_review(
             "trade": trade_dict,
             "run": run_dict,
             "account": {
-                "account_id": trade_dict.get("account_id") or run_dict.get("account_id"),
-                "account_name": trade_dict.get("account_name") or run_dict.get("account_name"),
-                "account_mode": trade_dict.get("account_mode") or run_dict.get("account_mode"),
-                "account_is_practice": trade_dict.get("account_is_practice") if trade_dict.get("account_is_practice") is not None else run_dict.get("account_is_practice"),
+                "account_id": trade_dict.get("account_id") or (run_dict or {}).get("account_id"),
+                "account_name": trade_dict.get("account_name") or (run_dict or {}).get("account_name"),
+                "account_mode": trade_dict.get("account_mode") or (run_dict or {}).get("account_mode"),
+                "account_is_practice": trade_dict.get("account_is_practice") if trade_dict.get("account_is_practice") is not None else (run_dict or {}).get("account_is_practice"),
             },
             "window": {
                 "start": _iso(window_start),

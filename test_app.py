@@ -257,10 +257,14 @@ def test_trade_review_returns_404_for_missing_trade(monkeypatch):
                 "FROM completed_trades",
                 {"row": None},
             ),
+            (
+                "FROM account_trades",
+                {"row": None},
+            ),
         ]
     )
 
-    monkeypatch.setattr(analytics_app, "ensure_schema_v2", lambda: None)
+    monkeypatch.setattr(analytics_app, "ensure_schema_v2", lambda *args, **kwargs: None)
     monkeypatch.setattr(analytics_app, "ANALYTICS_API_KEY", "test-token")
     monkeypatch.setattr(analytics_app, "_pool", _FakePool())
     monkeypatch.setattr(analytics_app, "get_conn", lambda: fake_conn)
@@ -271,6 +275,60 @@ def test_trade_review_returns_404_for_missing_trade(monkeypatch):
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Trade not found"
+
+
+def test_trade_review_resolves_account_trade_identifier(monkeypatch):
+    fake_conn = _SequencedFakeConn(
+        [
+            (
+                "FROM completed_trades",
+                {"row": None},
+            ),
+            (
+                "FROM account_trades",
+                {
+                    "row": {
+                        "id": 77,
+                        "run_id": None,
+                        "inserted_at": None,
+                        "occurred_at": datetime(2026, 3, 18, 10, 25, tzinfo=timezone.utc),
+                        "account_id": "acct-1",
+                        "account_name": "Practice",
+                        "account_mode": "practice",
+                        "account_is_practice": True,
+                        "broker_trade_id": "2299253381",
+                        "broker_order_id": "order-77",
+                        "contract_id": "ESM6",
+                        "side": 1,
+                        "size": 1,
+                        "price": 4512.75,
+                        "profit_and_loss": 243.5,
+                        "fees": 2.5,
+                        "voided": False,
+                        "source": "broker",
+                        "payload_json": {"broker_trade_id": "2299253381"},
+                    }
+                },
+            ),
+        ]
+    )
+
+    monkeypatch.setattr(analytics_app, "ensure_schema_v2", lambda *args, **kwargs: None)
+    monkeypatch.setattr(analytics_app, "ANALYTICS_API_KEY", "test-token")
+    monkeypatch.setattr(analytics_app, "_pool", _FakePool())
+    monkeypatch.setattr(analytics_app, "get_conn", lambda: fake_conn)
+    monkeypatch.setattr(analytics_app, "put_conn", lambda conn: None)
+
+    with TestClient(analytics_app.app) as client:
+        response = client.get("/trades/2299253381", headers={"Authorization": "Bearer test-token"})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["trade"]["trade_id"] == "2299253381"
+    assert body["trade"]["account_id"] == "acct-1"
+    assert body["run"]["run_id"] == "account-trade-2299253381"
+    assert body["account"]["account_mode"] == "practice"
+    assert body["analysis"]["entryExit"]["direction"] == "long"
 
 
 def test_trade_review_returns_normalized_bundle(monkeypatch):
@@ -613,7 +671,7 @@ def test_trade_review_returns_normalized_bundle(monkeypatch):
         ]
     )
 
-    monkeypatch.setattr(analytics_app, "ensure_schema_v2", lambda: None)
+    monkeypatch.setattr(analytics_app, "ensure_schema_v2", lambda *args, **kwargs: None)
     monkeypatch.setattr(analytics_app, "ANALYTICS_API_KEY", "test-token")
     monkeypatch.setattr(analytics_app, "_pool", _FakePool())
     monkeypatch.setattr(analytics_app, "get_conn", lambda: fake_conn)
